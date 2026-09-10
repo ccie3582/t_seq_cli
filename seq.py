@@ -257,26 +257,57 @@ def parse_index(arg, lo, hi, what):
 
 
 _SEQ_VAR_RE = re.compile(
-    r"(?i)^([Oo]*)(\d+)\*([+-]?(?:\d+(?:\.\d+)?))\*lfo(\d+)$")
-_SEQ_VAR_PLAIN_RE = re.compile(r"(?i)^([Oo]*)(\d+)\*lfo(\d+)$")
+    r"(?i)^([Oo]*)(\d+)((?:\*(?:(?:[+-]?(?:\d+(?:\.\d+)?))\*)?lfo\d+)+)$")
+_SEQ_VAR_TERM_RE = re.compile(
+    r"(?i)\*(?:(?P<coef>[+-]?(?:\d+(?:\.\d+)?))\*)?lfo(?P<ref>\d+)")
+
+
+def variation_terms(variation):
+    """Variation as a tuple of (coefficient, lfo index) pairs (empty if none)."""
+    if not variation:
+        return ()
+    return tuple((float(coef), int(ref)) for coef, ref in variation)
+
+
+def variation_offset(variation, lfos, bpm, now):
+    """Offset in scale steps / CC units: round(amp x lfo1 x lfo2 x ...)."""
+    terms = variation_terms(variation)
+    if not terms:
+        return 0
+    product = 1.0
+    for coef, ref in terms:
+        try:
+            product *= lfo.evaluate(lfos or {}, ref, now, bpm)
+        except ValueError:
+            return 0
+        product *= coef
+    return int(round(product))
+
+
+def variation_text(variation):
+    """Render a variation back to '<coef>*lfoN*lfoM' style text."""
+    parts = []
+    for coef, ref in variation_terms(variation):
+        parts.append(f"*{coef:g}*lfo{ref}" if coef != 1 else f"*lfo{ref}")
+    return "".join(parts)
 
 
 def seq_token_entry(tok):
     """Parse one sequence token -> None (rest) or (degree, shift, variation).
 
-    variation is None, or (amplitude, lfo_index): the note moves
-    round(lfo_value * amplitude) scale steps, wrapping across octaves.
+    variation is None, or a tuple of (coefficient, lfo index) pairs; any number
+    of LFOs may be multiplied together: the value moves by
+    round(amp x lfo1 x lfo2 x ...) scale steps (octaves wrap) or CC units.
     """
     if tok.lower() == "r":
         return None
     m = _SEQ_VAR_RE.match(tok)
     if m:
         shift = m.group(1).count("O") - m.group(1).count("o")
-        return (int(m.group(2)), shift, (float(m.group(3)), int(m.group(4))))
-    m = _SEQ_VAR_PLAIN_RE.match(tok)
-    if m:
-        shift = m.group(1).count("O") - m.group(1).count("o")
-        return (int(m.group(2)), shift, (1.0, int(m.group(3))))
+        terms = []
+        for coef, ref in _SEQ_VAR_TERM_RE.findall(m.group(3)):
+            terms.append((1.0 if coef in ("", None) else float(coef), int(ref)))
+        return (int(m.group(2)), shift, tuple(terms))
     m = re.fullmatch(r"([Oo]*)(\d+)", tok)
     if m:
         shift = m.group(1).count("O") - m.group(1).count("o")
@@ -291,8 +322,7 @@ def _entry_text(entry):
     prefix = "O" * shift if shift > 0 else "o" * (-shift)
     if variation is None:
         return f"{prefix}{degree}"
-    amp, ref = variation
-    return f"{prefix}{degree}*{amp:g}*lfo{ref}"
+    return f"{prefix}{degree}{variation_text(variation)}"
 
 
 def parse_division(text):
@@ -415,13 +445,7 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
             mt_set.append(False)
             continue
         degree, shift, variation = entry
-        offset = 0
-        if variation is not None:
-            amp, ref = variation
-            try:
-                offset = int(round(lfo.evaluate(lfos, ref, now, bpm) * amp))
-            except ValueError:
-                offset = 0
+        offset = variation_offset(variation, lfos, bpm, now)
         mt_expr = view["microtimes"].get(seq_index)
         mts.append(lfo_value(mt_expr, 0.0, -0.5, 0.5) * step_ms)
         mt_set.append(bool(mt_expr))
@@ -564,12 +588,7 @@ def sequence_offsets(entries, lfos, bpm, now):
         if entry is None or entry[2] is None:
             offsets.append(0)
             continue
-        amp, ref = entry[2]
-        try:
-            value = lfo.evaluate(lfos or {}, ref, now, bpm)
-        except ValueError:
-            value = 0.0
-        offsets.append(int(round(value * amp)))
+        offsets.append(variation_offset(entry[2], lfos, bpm, now))
     return offsets
 
 
@@ -1307,28 +1326,17 @@ class SeqShell(SeqCompletingCmd):
                 degree, shift, variation = entry
                 if view["type"] == "cc":
                     # CC pattern: the sequence holds raw values 0..127.
-                    offset = 0
-                    if variation is not None:
-                        amp, ref = variation
-                        try:
-                            offset = int(round(
-                                lfo.evaluate(self.project.get("lfos", {}), ref,
-                                             now, view["bpm"]) * amp))
-                        except ValueError:
-                            offset = 0
+                    offset = variation_offset(variation,
+                                              self.project.get("lfos", {}),
+                                              view["bpm"], now)
                     return max(0, min(127, degree + offset + 12 * shift))
                 if variation is None:
                     if degree >= len(intervals):
                         return None  # out of the current scale: silent step
                     return root_midi + intervals[degree] + 12 * shift
                 # LFO-driven: whole scale steps, wrapping across octaves.
-                amp, ref = variation
-                try:
-                    value = lfo.evaluate(self.project.get("lfos", {}), ref,
-                                         now, view["bpm"])
-                except ValueError:
-                    value = 0.0
-                index = degree + int(round(value * amp))
+                index = degree + variation_offset(
+                    variation, self.project.get("lfos", {}), view["bpm"], now)
                 size = len(intervals)
                 octave, pos = divmod(index, size)
                 return root_midi + 12 * (octave + shift) + intervals[pos]
@@ -1673,7 +1681,7 @@ class SeqShell(SeqCompletingCmd):
         print(f"  {'lfo<n> start|stop':<20} - start or stop an LFO from here (e.g. lfo3 start)")
         print(f"  {'status-lfo':<20} - show the parameters of all started LFOs")
         print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, sequence or phrase")
-        print(f"  {'rm <path> [setting]':<20} - delete/zeroize a track, pattern, sequence, phrase or setting")
+        print(f"  {'rm <path>|lfo<n>':<20} - delete a track/pattern/sequence/phrase, reset an LFO or a setting")
         print(f"  {'panic':<20} - stop all phrases and silence all MIDI outputs")
         print(f"  {'save [<file>]':<20} - save the whole configuration to a .cfg file")
         print(f"  {'load [<file>]':<20} - load the whole configuration from a .cfg file")
@@ -1818,6 +1826,34 @@ class SeqShell(SeqCompletingCmd):
         if not tmap:
             del tracks[track]
 
+    def reset_lfo_param(self, n, param, announce=True):
+        """Reset one LFO parameter (frequency/shape/phase/running)."""
+        param = {"freq": "frequency"}.get(param.lower(), param.lower())
+        entry = self.project.setdefault("lfos", {}).setdefault(n, {})
+        if param == "running":
+            entry.pop("running", None)
+            entry.pop(LFO_START_KEY, None)
+            shown = "stopped"
+        else:
+            entry.pop(param, None)
+            shown = {"frequency": "1 Hz", "shape": "sin", "phase": "0"}[param]
+        if announce:
+            suffix = " (default)" if shown != "stopped" else " (LFO stopped)"
+            print(f"Reset LFO {n} {param} to {shown}{suffix}.")
+        return shown
+
+    def reset_lfo(self, n, announce=True):
+        """Reset one global LFO to its defaults (and stop it)."""
+        entry = self.project.setdefault("lfos", {}).get(n)
+        was_running = bool(entry and entry.get("running"))
+        self.project.get("lfos", {}).pop(n, None)
+        if announce:
+            print(f"Reset LFO {n} to defaults (frequency 1 Hz, shape sin, "
+                  f"phase 0, stopped).")
+            if was_running:
+                print(f"  Note: LFO {n} was running and has been stopped.")
+        return was_running
+
     def do_rm(self, arg):
         "Delete/zeroize a track, pattern, sequence, phrase or pattern setting"
         parts = (arg or "").split()
@@ -1828,7 +1864,28 @@ class SeqShell(SeqCompletingCmd):
             print("       rm t1p1v1             remove a velocity")
             print("       rm t1p1sus1           remove a sustain")
             print("       rm t1p1mt1            remove a microtiming")
-            print("       rm t1p1 scale|root|bpm|channel|division|port   reset a setting")
+            print("       rm t1p1 scale|root|bpm|channel|division|type|controller|port")
+            print("       rm lfo1               reset an LFO (rm lfo = all of them)")
+            return
+        # LFO targets are not paths: 'lfo1', 'lfo 1' or 'lfo' (all LFOs).
+        text = " ".join(parts)
+        m = re.fullmatch(
+            r"(?i)lfo\s*(\d+|all)?(?:\s+(frequency|freq|shape|phase|running))?",
+            text)
+        if m:
+            if not m.group(1) or m.group(1).lower() == "all":
+                for n in range(1, MAX_LFOS + 1):
+                    self.reset_lfo(n, announce=False)
+                print(f"Reset all {MAX_LFOS} LFOs to their defaults (stopped).")
+                return
+            n = int(m.group(1))
+            if not 1 <= n <= MAX_LFOS:
+                print(f"Error: LFO number must be between 1 and {MAX_LFOS}.")
+                return
+            if m.group(2):
+                self.reset_lfo_param(n, m.group(2))
+            else:
+                self.reset_lfo(n)
             return
         try:
             path = parse_compact_path(parts[0], None, None)
@@ -2161,7 +2218,7 @@ class TrackShell(SeqCompletingCmd):
         print(f"  {'rm <path> [setting]':<18} - delete/zeroize a track, pattern, sequence, phrase or setting")
         print(f"  {'panic':<18} - stop all phrases and silence all MIDI outputs")
         print(f"  {'/':<18} - return to the main menu from anywhere")
-        print(f"  {'/ <command>':<18} - run a main-menu command, e.g. / lfo1 start")
+        print(f"  {'/ <command>':<18} - run a main-menu command and return to the top menu")
         print(f"  {'help':<18} - show this help")
         print(f"  {'exit':<18} - return to the main menu (playback keeps running)")
         print(f"\n  Current track: {self.track_number}")
@@ -2188,9 +2245,10 @@ class TrackShell(SeqCompletingCmd):
             if not command:
                 self.request_root()
                 return True
-            # '/ <root command>' runs at the root level, e.g. '/ lfo1 start'
+            # '/ <root command>' runs at the root and returns to the top menu.
             self.run_root_command(command)
-            return
+            self.request_root()
+            return True
         token, rest = parts[0], text[len(parts[0]):].strip()
         if token.lower().startswith("lfo"):  # jump to an LFO menu from here
             self._root_shell().onecmd(text)
@@ -2495,7 +2553,7 @@ class LfoShell(SeqCompletingCmd):
         print(f"Frequency set to {lfo.describe_frequency(value, bpm)}")
 
     def do_shape(self, arg):
-        "Show or set the LFO shape: sin, tri or saw"
+        "Show or set the LFO shape: sin, tri, saw or square"
         name = (arg or "").strip().lower()
         if not name:
             print(f"Shape: {self.shape}")
@@ -2532,6 +2590,35 @@ class LfoShell(SeqCompletingCmd):
         self._commit()
         print(f"Phase set to {value:g}")
 
+    def do_rm(self, arg):
+        "Reset this LFO (or another: rm lfo2) to its default values"
+        text = (arg or "").strip()
+        if not text:
+            self.parent_shell.reset_lfo(self.lfo_number)
+            self._load_from_store()
+            return
+        if text.lower() in ("frequency", "freq", "shape", "phase", "running"):
+            self.parent_shell.reset_lfo_param(self.lfo_number, text)
+            self._load_from_store()
+            return
+        m = re.fullmatch(r"(?i)lfo\s*(\d+)?", text)
+        if m and m.group(1):
+            n = int(m.group(1))
+            if not 1 <= n <= MAX_LFOS:
+                print(f"Error: LFO number must be between 1 and {MAX_LFOS}.")
+                return
+            self.parent_shell.reset_lfo(n)
+            if n == self.lfo_number:
+                self._load_from_store()
+            return
+        if m:  # 'rm lfo' -> all
+            for n in range(1, MAX_LFOS + 1):
+                self.parent_shell.reset_lfo(n, announce=False)
+            print(f"Reset all {MAX_LFOS} LFOs to their defaults (stopped).")
+            self._load_from_store()
+            return
+        self.parent_shell.onecmd("rm " + text)
+
     def do_show(self, arg):
         "Show all parameters of this LFO"
         print(f"\nLFO {self.lfo_number} parameters:")
@@ -2554,15 +2641,16 @@ class LfoShell(SeqCompletingCmd):
         print(f"  {'shape [<name>]':<20} - show or set the shape: sin, tri, saw, square")
         print(f"  {'phase [<-1..1>]':<20} - start point of the waveform (-1 to 1)")
         print(f"  {'show':<20} - show all parameters of this LFO")
+        print(f"  {'rm [lfo<n>] [param]':<20} - reset this LFO (or another, or one parameter)")
         print(f"  {'start':<20} - start this LFO (stopped by default)")
         print(f"  {'stop':<20} - stop this LFO")
         print(f"  {'live':<20} - show the live instantaneous value next to the prompt")
         print(f"  {'live stop':<20} - stop the live view")
         print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, sequence or phrase")
-        print(f"  {'rm <path> [setting]':<20} - delete/zeroize a track, pattern, sequence, phrase or setting")
+        print(f"  {'rm <path>|lfo<n>':<20} - delete a track/pattern/sequence/phrase, reset an LFO or a setting")
         print(f"  {'panic':<20} - stop all phrases and silence all MIDI outputs")
         print(f"  {'/':<20} - return to the main menu from anywhere")
-        print(f"  {'/ <command>':<20} - run a main-menu command, e.g. / lfo1 start")
+        print(f"  {'/ <command>':<20} - run a main-menu command and return to the top menu")
         print(f"  {'help':<20} - show this help")
         print(f"  {'exit':<20} - return to the main menu")
         print(f"\n  LFO {self.lfo_number}: {self._running_text()}, frequency "
@@ -2592,7 +2680,8 @@ class LfoShell(SeqCompletingCmd):
                 self.request_root()
                 return True
             self.parent_shell.run_root_command(command)
-            return
+            self.request_root()
+            return True
         if parts:
             token = parts[0]
             rest = text[len(token):].strip()
@@ -2806,8 +2895,10 @@ class PatternShell(SeqCompletingCmd):
                                playhead=self._hist_playhead(), spin=spin)
 
     def do_hist(self, arg):
-        "Show a per-step histogram of a phrase: hist [f<k>] [live|stop]"
+        "Show a per-step histogram of a phrase: hist [f<k>|s<k>] [live|once|stop]"
         text = (arg or "").strip().lower()
+        if text.startswith("live "):
+            text = text[5:].strip()  # accept 'live stop' / 'live off'
         if text in ("stop", "off"):
             if not getattr(self, "_live_block", None):
                 print("The histogram live view is not running.")
@@ -2818,6 +2909,8 @@ class PatternShell(SeqCompletingCmd):
         if text.endswith("live"):
             live = True
             text = text[:-4].strip()
+        elif text.endswith("once") or text.endswith("static"):
+            text = text.rsplit(None, 1)[0] if " " in text else ""
         phrase, expr, label = self._hist_target(text)
         if phrase is None:
             if label:
@@ -3126,8 +3219,10 @@ class PatternShell(SeqCompletingCmd):
                 print(f"  Degrees index the {self.scale} scale (0 = root); "
                       f"'r' is a rest.")
                 print("  Prefix O = next octave up, o = next octave down (e.g. O0, o3).")
-            print("  LFO variation: <degree>*<amp>*lfo<N> e.g. 0*5*lfo1 moves "
-                  "round(lfo*5) scale steps (octaves wrap).")
+            print("  LFO variation: <degree>*<amp>*lfo<N>[*lfo<M>...] e.g. "
+                  "0*5*lfo1 or 0*5*lfo1*lfo2")
+            print("     moves round(amp x lfo1 x lfo2 x ...) scale steps "
+                  "(octaves wrap; CC values clamp to 0..127).")
             return False
         parsed = []
         max_degree = 127 if cc else len(scales.SCALES[self.scale]) - 1
@@ -3138,7 +3233,7 @@ class PatternShell(SeqCompletingCmd):
                 what = ("a value 0..127" if cc else
                         "a scale degree like 0, an octave prefixed one like O0 / o3")
                 print(f"Error: invalid token '{tok}'. Use {what}, 'r' for a rest, "
-                      f"or an LFO variation like 0*5*lfo1.")
+                      f"or an LFO variation like 0*5*lfo1*lfo2.")
                 return False
             if entry is None:
                 parsed.append(None)  # rest
@@ -3154,10 +3249,11 @@ class PatternShell(SeqCompletingCmd):
                           f"Use O/o to move octaves.")
                 return False
             if variation is not None:
-                amp, ref = variation
-                if not 1 <= ref <= MAX_LFOS:
-                    print(f"Error: LFO reference must be between 1 and {MAX_LFOS}.")
-                    return False
+                for _coef, ref in variation_terms(variation):
+                    if not 1 <= ref <= MAX_LFOS:
+                        print(f"Error: LFO reference lfo{ref} must be between "
+                              f"1 and {MAX_LFOS}.")
+                        return False
             parsed.append(entry)
         self.seqs[n] = parsed
         self._commit()
@@ -3379,10 +3475,10 @@ class PatternShell(SeqCompletingCmd):
         print(f"  {'p<m>':<20} - switch to another pattern (m = 1-16)")
         print(f"  {'t<n>':<20} - switch to another track menu")
         print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, sequence or phrase")
-        print(f"  {'rm <path> [setting]':<20} - delete/zeroize a track, pattern, sequence, phrase or setting")
+        print(f"  {'rm <path>|lfo<n>':<20} - delete a track/pattern/sequence/phrase, reset an LFO or a setting")
         print(f"  {'panic':<20} - stop all phrases and silence all MIDI outputs")
         print(f"  {'/':<20} - return to the main menu from anywhere")
-        print(f"  {'/ <command>':<20} - run a main-menu command, e.g. / lfo1 start")
+        print(f"  {'/ <command>':<20} - run a main-menu command and return to the top menu")
         print(f"  {'help':<20} - show this help")
         print(f"  {'exit':<20} - return to track {self.parent_shell.track_number} "
               f"(playback keeps running)")
@@ -3427,7 +3523,8 @@ class PatternShell(SeqCompletingCmd):
                 self.request_root()
                 return True
             self.run_root_command(command)
-            return
+            self.request_root()
+            return True
         token, rest = parts[0], text[len(parts[0]):].strip()
         low = token.lower()
         if low.startswith("lfo"):  # jump to an LFO menu from here

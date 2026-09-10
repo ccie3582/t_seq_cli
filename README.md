@@ -68,7 +68,11 @@ If no MIDI port is selected yet, start playing will tell you:
 | `p3` | inside a pattern menu: switch to pattern 3 in place |
 | `s2`, `f1`, `v0`, `sus0`, `mt0` | touch a leaf of the current pattern |
 | `/` | return to the main menu (`seq>`) from anywhere |
-| `/ <command>` | run a **main-menu** command without leaving the current menu, e.g. `/ lfo1 start`, `/ bpm 100` |
+| `/ <command>` | run a **main-menu** command, then return to the main menu — e.g. `/ lfo1 start`, `/ bpm 100` |
+
+Any line starting with `/` unwinds all the way to the top layer: from `seq:lfo:3>`
+(itself opened from `seq:t1p1>`) a `/` or `/ lfo2 stop` lands you at `seq>`, never
+at the menu the LFO was called from.
 | `exit` | go one level up (playback keeps running) |
 | `help` / `help <command>` | command list / detail for one command |
 
@@ -162,16 +166,28 @@ list-s              # list all configured sequences
 | `r` | rest — the step is skipped (no note, no CC) |
 | `<base>*<amp>*lfo<N>` | LFO variation: value becomes `base + round(lfo<N> × amp)` |
 | `<base>*lfo<N>` | same with amp = 1 |
+| `<base>*<amp>*lfo<N>*lfo<M>…` | several LFOs multiply: `base + round(amp × lfo<N> × lfo<M> × …)` |
+| `<base>*<amp1>*lfo<N>*<amp2>*lfo<M>` | per-LFO coefficients: `base + round(amp1·lfo<N> · amp2·lfo<M> · …)` |
 
-`amp` may be negative or fractional (`0*-2.5*lfo3`). In a note pattern the result
-is a **scale step index** and octaves wrap, so `0*5*lfo1` walks ±5 notes of the
-selected scale (e.g. in C major: `+5` → A4, `-5` → E3). In a CC pattern the
-result is clamped to `0..127`.
+`amp` may be negative or fractional (`0*-2.5*lfo3`) and **any number of LFOs may
+be chained** — the offsets multiply, so `s0 0*5*lfo1*lfo2` moves by
+`round(5 × lfo1 × lfo2)`. In a note pattern the result is a **scale step index**
+and octaves wrap, so `0*5*lfo1` walks ±5 notes of the selected scale (e.g. in
+C major: `+5` → A4, `-5` → E3). In a CC pattern the result is clamped to
+`0..127`.
 
 ```
-seq:t1p1> s1 0*5*lfo1 0 0     # a note that moves with LFO 1
-seq:t1p1> s1                  # s1: 0*5*lfo1 0 0   -> A4 C4 C4
+seq:t1p1> s1 0*5*lfo1 0 0        # a note that moves with LFO 1
+seq:t1p1> s1                     # s1: 0*5*lfo1 0 0   -> A4 C4 C4
+seq:t1p1> s2 0*5*lfo1*lfo2       # amplitude shaped by two LFOs
+seq:t1p1> s2                     # s2: 0*5*lfo1*lfo2 -> C4
+seq:t1p1> type CC
+seq:t1p1> controller 1
+seq:t1p1> s3 63*30*lfo1*lfo2     # CC1 = 63 + round(30 x lfo1 x lfo2)
 ```
+
+A stopped (or not-yet-latched) LFO counts as 0, so any chain containing one
+currently reads 0 and the value falls back to the base number.
 
 ### 4.2 Phrases — `f1 … f16`
 
@@ -434,6 +450,21 @@ rm t1p1 scale                # reset a setting to its default
 rm t1p1 root  |  bpm  |  channel  |  division  |  type  |  controller  |  port
 ```
 
+### Resetting LFOs
+
+```
+rm lfo1                      # LFO 1 back to defaults: 1 Hz, sin, phase 0, stopped
+rm lfo2 frequency            # reset one parameter (frequency | shape | phase | running)
+rm lfo                       # reset all 8 LFOs (also: 'rm lfo all')
+seq:lfo:4> rm                # reset the LFO you are inside
+seq:lfo:4> rm shape          # reset one parameter of that LFO
+seq:lfo:4> rm lfo2           # reset another LFO without leaving the menu
+```
+
+A running LFO is stopped by the reset (it reports "was running and has been
+stopped"), and a fully default LFO is no longer written to the configuration
+file. Resets work from every menu, because `rm` is routed to the main shell.
+
 Removing a leaf/setting prunes empty patterns and tracks automatically. Copying
 and removing always targets the same kind on both sides (mismatches are
 refused), and a running phrase of a touched pattern is stopped first.
@@ -517,7 +548,8 @@ player is independent.
 
 **LFO (`seq:lfo:1>`)**
 `frequency`, `shape`, `phase`, `start`, `stop`, `live [stop]`, `show`,
-`start <path>`/`stop <path>` (phrase playback), `cp`, `rm`, `panic`, `help`,
+`rm [lfo<n>] [param]` (reset this/another LFO or one parameter),
+`start <path>`/`stop <path>` (phrase playback), `cp`, `panic`, `help`,
 `/`, `/ <command>`, `exit`.
 
 ---
