@@ -95,7 +95,7 @@ At the main menu a path followed by a value **edits** the leaf:
 ```
 t1p1s0 0 0 5            # set sequence 0
 t1p1f1 inf*s0           # define phrase 1
-t1p1v0 64+0.4*lfo1      # velocity expression
+t1p1v0 64+40*lfo1       # velocity expression
 t1p1sus0 0.5+0.5*lfo1   # sustain expression
 t1p1mt0 -0.05           # microtiming expression
 t1p1 scale dorian       # pattern setting
@@ -238,7 +238,7 @@ Examples:
 
 ```
 v0 45                    # constant velocity
-v1 =64+0.4*lfo1          # 64 plus 40% of LFO 1
+v1 =64+40*lfo1           # 64 plus 40*(LFO1)
 sus0 0.5                 # hold half the step
 sus1 0.25+0.25*lfo2      # vary the length
 mt0 -0.05                # 5% of a step early
@@ -271,7 +271,7 @@ phrases weights, division, BPM, microtiming, channel, port, `cp`/`rm`,
 seq:t1p1> type CC
 seq:t1p1> controller 1
 seq:t1p1> channel 3
-seq:t1p1> s0 63*30*lfo1 r        # CC1 sweeps 33..93
+seq:t1p1> s0 63+30*lfo1 r        # CC1 sweeps 33..93
 seq:t1p1> f1 inf*s0
 seq:t1p1> division 1/8
 seq> lfo1 shape sin
