@@ -1,4 +1,4 @@
-# seq — a MIDI CLI sequencer
+# t_seq_cli — a MIDI CLI sequencer
 
 An interactive, hierarchical MIDI sequencer that runs in a terminal. You describe
 music as **tracks → patterns → sequences → phrases**, play it to a MIDI output
