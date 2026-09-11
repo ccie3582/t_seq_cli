@@ -1,6 +1,6 @@
 """seq — interactive CLI for a multi-track MIDI sequencer.
 
-Command-line shell modeled on viplab_ip.py:
+Command-line shell modeled on cli.py:
   * hyphenated commands mapped to do_* methods
   * Tab autocompletion (readline when available; a built-in key-by-key
     editor otherwise, so completion also works on Windows consoles)
