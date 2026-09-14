@@ -1,20 +1,31 @@
-"""Note parameter sequences (velocity 0..127, sustain fraction 0..1):
-constant or LFO-linked expressions.
+"""Note parameter sequences (velocity 0..127, sustain in steps, microtiming).
 
-Syntax (per sequence): a plain number (``45``), an LFO reference (``lfo1``),
-a scaled LFO reference (``0.4*lfo1``), or a sum of such terms
-(``64+0.4*lfo1``, ``100-0.5*lfo2``).
+Syntax (per sequence): a plain number (``45``), a fraction of a step (``1/4``),
+an LFO reference (``lfo1``), a scaled LFO reference (``0.4*lfo1``), or a sum of
+such terms (``64+0.4*lfo1``, ``0.5+0.5*lfo1``).
 
 Velocity values are clamped to the MIDI range (>127 sends 127, <0 sends 0);
-sustain values are fractions of the step, clamped to 0..1; microtiming values
-are signed fractions of the step, clamped to -0.5..0.5.
+sustain values are lengths in **steps** (``0.5`` = half a step, ``2`` = two
+steps, ``1/4`` = a quarter step), clamped to 0..SUSTAIN_MAX_STEPS; microtiming
+values are signed fractions of the step, clamped to -0.5..0.5.
 """
 
 import re
 
 import lfo
 
-_NUM = r"\d+(?:\.\d+)?"
+_NUM = r"\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?"
+
+
+def _number(text):
+    """Evaluate a numeric literal: '2', '0.5', '1/4', '3/4'."""
+    if "/" in text:
+        num, den = text.split("/", 1)
+        den = float(den)
+        if den == 0:
+            raise ValueError("division by zero in a number")
+        return float(num) / den
+    return float(text)
 _TERM_LFO = re.compile(rf"^([+-]?)(?:({_NUM})\*)?lfo(\d+)$", re.IGNORECASE)
 _TERM_NUM = re.compile(rf"^([+-]?)({_NUM})$")
 
@@ -45,27 +56,30 @@ def parse(text):
         m = _TERM_LFO.match(term)
         if m:
             sign = -1.0 if m.group(1) == "-" else 1.0
-            coef = float(m.group(2)) if m.group(2) else 1.0
+            try:
+                coef = _number(m.group(2)) if m.group(2) else 1.0
+            except ValueError as e:
+                raise ValueError(f"invalid number '{m.group(2)}': {e}")
             out.append((sign * coef, int(m.group(3))))
             continue
         m = _TERM_NUM.match(term)
         if m:
             sign = -1.0 if m.group(1) == "-" else 1.0
-            out.append((sign * float(m.group(2)), None))
+            try:
+                value = _number(m.group(2))
+            except ValueError as e:
+                raise ValueError(f"invalid number '{m.group(2)}': {e}")
+            out.append((sign * value, None))
             continue
         raise ValueError(_term_hint(term))
     return out
 
 
 def canonical(text):
-    """Canonical text form of a velocity expression."""
-    parts = []
-    for i, (coef, ref) in enumerate(parse(text)):
-        sign = "-" if coef < 0 else ("+" if i else "")
-        mag = abs(coef)
-        body = f"{mag:g}*lfo{ref}" if ref is not None else f"{mag:g}"
-        parts.append(sign + body)
-    return "".join(parts)
+    """Canonical text form: whitespace-free, as typed (keeps '1/4' style)."""
+    cleaned = re.sub(r"\s+", "", text or "")
+    parse(cleaned)  # validate
+    return cleaned
 
 
 def raw_value(text, lfos, bpm, t):

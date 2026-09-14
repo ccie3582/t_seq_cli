@@ -1,4 +1,5 @@
-"""Normalized LFO waveform evaluation (values in [-1, 1]) and parameter
+"""Normalized LFO waveform evaluation: bipolar [-1, 1] (or [0, 1] for ramp,
+sample-and-hold for random) and parameter
 expressions such as '0.5*lfo2' (modulated by another LFO).
 
 Frequencies may also be tied to the global tempo: '8bpm' means 8 cycles per
@@ -109,8 +110,20 @@ def describe_frequency(value, bpm):
     return f"{param_to_text(value)} (modulated)"
 
 
-def _wave(shape, frequency, phase, t):
-    """Waveform value in [-1, 1]; phase is the start point in cycles."""
+def _rand(cycle, seed):
+    """Deterministic pseudo-random value in [-1, 1] for a cycle (sample-hold)."""
+    x = math.sin((cycle + 1) * 12.9898 + (seed or 0) * 78.233) * 43758.5453
+    frac = x - math.floor(x)
+    return 2.0 * frac - 1.0
+
+
+def _wave(shape, frequency, phase, t, seed=None):
+    """Waveform value; phase is the start point in cycles.
+
+    sin / tri / saw / square run in [-1, 1]; ramp runs in [0, 1] (it rises from
+    0 to 1 across the cycle and jumps back to 0); random holds a new random
+    value in [-1, 1] for each cycle, so its frequency is the rate of change.
+    """
     if frequency <= 0:
         return 0.0
     pos = frequency * t + phase
@@ -121,17 +134,23 @@ def _wave(shape, frequency, phase, t):
         return 1.0 - 4.0 * abs(frac - 0.5)
     if shape == "square":
         return 1.0 if frac < 0.5 else -1.0
+    if shape == "ramp":
+        return frac
+    if shape == "random":
+        # Sample and hold: one new value per cycle. Deterministic in the cycle
+        # number and the LFO, so every view agrees and restarts repeat.
+        return _rand(math.floor(pos), seed)
     return 2.0 * frac - 1.0  # saw
 
 
-def value(shape, frequency, phase, t):
-    """Instantaneous normalized LFO value at time t (seconds).
+def value(shape, frequency, phase, t, seed=None):
+    """Instantaneous normalized LFO value at time t (seconds), seed = RNG id.
 
-    shape: 'sin', 'tri', 'saw' or 'square'; phase (cycles, -1..1) is the start
-    point:
+    shape: 'sin', 'tri', 'saw', 'square', 'random' (bipolar) or 'ramp' (0..1);
+    phase (cycles, -1..1) is the start point:
     the oscillator begins at that point of the waveform at t = 0.
     """
-    return _wave(shape, frequency, phase, t)
+    return _wave(shape, frequency, phase, t, seed)
 
 
 def evaluate(lfos, index, t, bpm=120, _seen=None):
@@ -179,4 +198,5 @@ def evaluate(lfos, index, t, bpm=120, _seen=None):
     freq = resolve("frequency", 1.0)
     phase = float(entry.get("phase", 0.0))
     phase = max(-1.0, min(1.0, phase))
-    return _wave(entry.get("shape", "sin"), freq, phase, elapsed)
+    return _wave(entry.get("shape", "sin"), freq, phase, elapsed,
+                 seed=index)

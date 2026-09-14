@@ -13,25 +13,30 @@ phrase as a loop that repeats until stopped elsewhere (not at phrase level).
 Grammar (canonical forms only, no pattern binding yet):
 
     expr    := 'inf*' wrap | sum
-    wrap    := '(' sum ')' | 'seq' DIGIT
+    wrap    := '(' sum ')' | 'seq' DIGIT | 'o' DIGIT
     sum     := term ( '+' term )*
     term    := count '*' unit | unit
-    unit    := 'seq' DIGIT | '(' sum ')'
+    unit    := 's' DIGIT | 'o' DIGIT | '(' sum ')'
     count   := positive integer
+
+Note patterns and CC patterns reference **sequences** (``s0``); loop patterns
+reference **order lists** (``o0``). The same grammar covers both, and the
+reference kind travels with the unit so the caller can resolve it.
 """
 
 import re
 
-MAX_SEQ_INDEX = 9  # seq0..seq9
-MAX_PATTERN = 16   # p1..p16 label constraint
+MAX_SEQ_INDEX = 9    # sequences  s0..s9
+MAX_ORDER_INDEX = 9  # order lists o0..o9
+MAX_PATTERN = 16     # p1..p16 label constraint
 
 
 class PhraseError(ValueError):
     """Raised for invalid phrase expression syntax."""
 
 
-_TOKEN_RE = re.compile(r"\s*((?:seq|s)\d+|\d+|inf|[()+*])")
-_SEQ_TOKEN_RE = re.compile(r"(?:seq|s)(\d+)$")
+_TOKEN_RE = re.compile(r"\s*((?:seq|s|o)\d+|\d+|inf|[()+*])")
+_UNIT_TOKEN_RE = re.compile(r"(?i)(seq|s|o)(\d+)$")
 
 
 def _tokenize(text):
@@ -46,20 +51,35 @@ def _tokenize(text):
     return tokens
 
 
+def _unit_ref(token):
+    """'s3'/'seq3' -> ('seq', 3); 'o2' -> ('order', 2); None otherwise."""
+    m = _UNIT_TOKEN_RE.fullmatch(token or "")
+    if not m:
+        return None
+    kind = "order" if m.group(1).lower() == "o" else "seq"
+    return (kind, int(m.group(2)))
+
+
 def _seq_index(token):
-    """'s3' / 'seq3' -> 3, or None when the token is not a sequence ref."""
-    m = _SEQ_TOKEN_RE.fullmatch(token)
-    return int(m.group(1)) if m else None
+    """3 for 's3'/'seq3', or None when the token is not a sequence ref."""
+    ref = _unit_ref(token)
+    return ref[1] if ref and ref[0] == "seq" else None
 
 
-def _parse_seq(token):
-    """'s3' (or legacy 'seq3') -> 3, validated against s0..s9."""
-    n = _seq_index(token)
-    if n is None:
-        raise PhraseError(f"Not a sequence reference: {token}")
-    if not 0 <= n <= MAX_SEQ_INDEX:
-        raise PhraseError(f"Sequence {token} out of range (use s0-s{MAX_SEQ_INDEX}).")
-    return n
+def _parse_unit(token):
+    """Validate a unit reference -> ('seq', n) or ('order', n)."""
+    ref = _unit_ref(token)
+    if ref is None:
+        raise PhraseError(f"Not a sequence or order reference: {token}")
+    kind, n = ref
+    if kind == "seq":
+        if not 0 <= n <= MAX_SEQ_INDEX:
+            raise PhraseError(
+                f"Sequence {token} out of range (use s0-s{MAX_SEQ_INDEX}).")
+    elif not 0 <= n <= MAX_ORDER_INDEX:
+        raise PhraseError(
+            f"Order list {token} out of range (use o0-o{MAX_ORDER_INDEX}).")
+    return (kind, n)
 
 
 class _Parser:
@@ -88,16 +108,17 @@ class _Parser:
             self.take("*")
             tok = self.peek()
             if tok is None:
-                raise PhraseError("Expected a sequence or '(' after 'inf*'.")
-            if _seq_index(tok) is not None:
+                raise PhraseError("Expected a sequence, order or '(' after 'inf*'.")
+            if _unit_ref(tok) is not None:
                 self.pos += 1
-                inner = ("seq", _parse_seq(tok))
+                inner = _parse_unit(tok)
             elif tok == "(":
                 self.pos += 1
                 inner = self._parse_sum()
                 self.take(")")
             else:
-                raise PhraseError(f"Unexpected token {tok!r}: expected a sequence or '(' after 'inf*'.")
+                raise PhraseError(f"Unexpected token {tok!r}: expected a "
+                                  f"sequence, order or '(' after 'inf*'.")
             if self.peek() is not None:
                 raise PhraseError("inf can only wrap the whole phrase expression.")
             return ("inf", inner)
@@ -122,10 +143,10 @@ class _Parser:
             self.take("*")
         tok = self.peek()
         if tok is None:
-            raise PhraseError("Expected a sequence or group after the multiplier.")
-        if _seq_index(tok) is not None:
+            raise PhraseError("Expected a sequence, order or group after the multiplier.")
+        if _unit_ref(tok) is not None:
             self.pos += 1
-            return (count, ("seq", _parse_seq(tok)))
+            return (count, _parse_unit(tok))
         if tok == "inf":
             raise PhraseError("'inf' is only allowed as the outermost multiplier.")
         if tok == "(":
@@ -133,7 +154,8 @@ class _Parser:
             items = self._parse_sum()
             self.take(")")
             return (count, ("group", items))
-        raise PhraseError(f"Unexpected token {tok!r}: expected a sequence or '('.")
+        raise PhraseError(f"Unexpected token {tok!r}: expected a sequence, "
+                          f"order or '('.")
 
 
 def _fmt_sum(items):
@@ -142,7 +164,12 @@ def _fmt_sum(items):
 
 def _fmt_term(item):
     count, unit = item
-    body = f"s{unit[1]}" if unit[0] == "seq" else f"({_fmt_sum(unit[1])})"
+    if unit[0] == "seq":
+        body = f"s{unit[1]}"
+    elif unit[0] == "order":
+        body = f"o{unit[1]}"
+    else:
+        body = f"({_fmt_sum(unit[1])})"
     return body if count == 1 else f"{count}*{body}"
 
 
@@ -173,5 +200,25 @@ def parse_phrase_expr(text):
         inner = tree[1]
         if isinstance(inner, list):  # inf*(sum)
             return f"inf*({_fmt_sum(inner)})"
-        return f"inf*s{inner[1]}"  # inf*sN
+        return f"inf*{_fmt_term((1, inner))}"  # inf*sN / inf*oN
     return _fmt_sum(tree)
+
+
+def unit_refs(text):
+    """All (kind, index) references used by a phrase ('seq' or 'order')."""
+    out = []
+
+    def walk(items):
+        for _count, unit in items:
+            if unit[0] == "group":
+                walk(unit[1])
+            else:
+                out.append(unit)
+
+    tree = parse_phrase_tree(text)
+    if tree[0] == "inf":
+        inner = tree[1]
+        walk(inner) if isinstance(inner, list) else out.append(inner)
+    else:
+        walk(tree)
+    return out

@@ -17,7 +17,9 @@ import midi_ports
 import phrases
 
 VELOCITY = 100
-SUSTAIN_FRACTION = 0.5
+SUSTAIN_FRACTION = 0.5   # default note length, in steps
+SUSTAIN_MAX_STEPS = 8    # longest note length, in steps
+MICROTIME_MAX_STEPS = 8  # largest microtiming offset, in steps (+/-)
 
 _winmm = ctypes.WinDLL("winmm")
 
@@ -71,56 +73,61 @@ def panic_ports(port_names):
     return sent
 
 
-def _flatten_terms(terms, get_seq):
-    """Flatten to steps tagged with their source sequence index.
+def _flatten_terms(terms, get_unit):
+    """Flatten to steps tagged with their source unit index.
 
-    Each step is (seq_index, entry) where entry is None for a rest.
+    Each step is (unit_index, entry) where entry is None for a rest. A unit is
+    a sequence (note/CC patterns) or an order list (loop patterns).
     """
     out = []
     for count, unit in terms:
-        if unit[0] == "seq":
+        if unit[0] in ("seq", "order"):
             index = unit[1]
-            seq = get_seq(index)
+            seq = get_unit(unit[0], index)
             if seq is None:
+                what = "seq" if unit[0] == "seq" else "o"
                 raise ValueError(
-                    f"Phrase references seq{index} but it is not configured "
+                    f"Phrase references {what}{index} but it is not configured "
                     f"in this pattern.")
             tagged = [(index, entry) for entry in seq]
             for _ in range(count):
                 out.extend(tagged)
         else:  # ('group', terms-list)
-            inner = _flatten_terms(unit[1], get_seq)
+            inner = _flatten_terms(unit[1], get_unit)
             for _ in range(count):
                 out.extend(inner)
     return out
 
 
-def flatten_phrase(text, get_seq):
+def flatten_phrase(text, get_unit):
     """Flatten a phrase expression into a step plan.
 
-    get_seq(index) -> list of entries (None = rest, else (degree, shift)) or
-    None when the sequence is not configured.
+    get_unit(kind, index) -> list of entries (None = rest; a sequence entry is
+    (degree, shift, variation), an order entry is a slice number) or None when
+    the referenced sequence / order list is not configured.
 
     Returns (plan, infinite) where plan is the ordered list of
-    (sequence_index, entry) steps of one pass; infinite True means the caller
-    must loop the plan until stopped.
+    (unit_index, entry) steps of one pass; infinite True means the caller must
+    loop the plan until stopped.
     Raises phrases.PhraseError / ValueError for invalid input.
     """
+    def resolve(unit):
+        index = unit[1]
+        seq = get_unit(unit[0], index)
+        if seq is None:
+            what = "seq" if unit[0] == "seq" else "o"
+            raise ValueError(
+                f"Phrase references {what}{index} but it is not configured "
+                f"in this pattern.")
+        return [(index, entry) for entry in seq]
+
     tree = phrases.parse_phrase_tree(text)
     if tree[0] == "inf":
         inner = tree[1]
-        if isinstance(inner, list):
-            plan = _flatten_terms(inner, get_seq)
-        else:
-            index = inner[1]
-            seq = get_seq(index)
-            if seq is None:
-                raise ValueError(
-                    f"Phrase references seq{index} but it is not configured "
-                    f"in this pattern.")
-            plan = [(index, entry) for entry in seq]
+        plan = _flatten_terms(inner, get_unit) if isinstance(inner, list) \
+            else resolve(inner)
         return plan, True
-    return _flatten_terms(tree, get_seq), False
+    return _flatten_terms(tree, get_unit), False
 
 
 def _msg(status, channel, note, velocity):
@@ -203,7 +210,8 @@ class Player:
         self.velocity_resolver = velocity_resolver
         # sustain_resolver(seq_index, now) -> 0..1 share of the step (optional).
         self.sustain_resolver = sustain_resolver
-        # microtime_resolver(seq_index, now) -> -0.5..0.5 offset in steps.
+        # microtime_resolver(seq_index, now) -> offset in steps
+        # (clamped to +/-MICROTIME_MAX_STEPS; negative = earlier).
         self.microtime_resolver = microtime_resolver
         # "note" sends note on/off; "cc" sends control change messages.
         self.mode = mode
@@ -248,14 +256,44 @@ class Player:
             time.sleep(0.05)
 
     def _run(self):
-        last_note = None
-        try:
-            def note_off():
-                nonlocal last_note
-                if last_note is not None:
-                    self._send(0x80, last_note, 0)
-                    last_note = None
+        # Notes are polyphonic: every note-on gets its own note-off, scheduled
+        # for note_on + sustain. A sustain longer than one step therefore rings
+        # *over* the following notes instead of blocking the sequencer.
+        pending = []  # [note, release time], kept in release order
 
+        def release_due(now):
+            """Send the note-offs whose length has elapsed by 'now'."""
+            while pending and pending[0][1] <= now:
+                note, _due = pending.pop(0)
+                self._send(0x80, note, 0)
+
+        def release_all():
+            while pending:
+                note, _due = pending.pop(0)
+                self._send(0x80, note, 0)
+
+        def wait_until(target):
+            """Sleep until 'target', releasing note-offs that fall due first.
+
+            Returns False when playback was asked to stop (so stop/panic stay
+            responsive even with very long sustains).
+            """
+            while True:
+                now = time.monotonic()
+                if pending and pending[0][1] < target:
+                    delay = pending[0][1] - now
+                    if delay > 0 and self._stop_event.wait(delay):
+                        return False
+                    release_due(time.monotonic())
+                    continue
+                delay = target - now
+                if delay <= 0:
+                    return True
+                if self._stop_event.wait(delay):
+                    return False
+                return True
+
+        try:
             grid = time.monotonic()  # ideal time of the current step
             last_step_time = None
             while True:
@@ -277,14 +315,18 @@ class Player:
                     seq_index, entry = step
                     if self.microtime_resolver is not None:
                         offset = self.microtime_resolver(seq_index, time.monotonic())
-                        offset = max(-0.5, min(0.5, offset)) * self.step_time
+                        offset = max(-MICROTIME_MAX_STEPS,
+                                     min(MICROTIME_MAX_STEPS, offset)) \
+                            * self.step_time
                     else:
                         offset = 0.0
                     target = grid + offset
-                    delay = target - time.monotonic()
-                    if delay > 0:
-                        time.sleep(delay)  # early/late note (grid never drifts)
+                    # Early/late note (grid never drifts); note-offs that come
+                    # due before the next note-on are sent on the way.
+                    if not wait_until(target):
+                        return
                     now = time.monotonic()
+                    release_due(now)
                     note = self.resolver(entry, now)
                     if note is None or not 0 <= note <= 127:
                         grid += self.step_time  # rest / out-of-range step
@@ -303,11 +345,12 @@ class Player:
                         share = self.sustain_resolver(seq_index, now)
                     else:
                         share = SUSTAIN_FRACTION
-                    hold = self.step_time * max(0.0, min(1.0, share))
+                    hold = self.step_time * max(
+                        0.0, min(SUSTAIN_MAX_STEPS, share))
                     self._send(0x90, note, velocity)
-                    last_note = note
-                    time.sleep(hold)
-                    note_off()
+                    pending.append([note, now + hold])
+                    pending.sort(key=lambda item: item[1])
+                    release_due(time.monotonic())  # e.g. a zero-length note
                     grid += self.step_time
                 if not self.infinite:
                     break
@@ -317,7 +360,7 @@ class Player:
             self.error = e
         finally:
             try:
-                note_off()
+                release_all()  # never leave a note hanging
             except Exception:
                 pass
             # The device handle is shared; keep it open while other players

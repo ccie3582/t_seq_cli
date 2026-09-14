@@ -1,6 +1,6 @@
 """seq — interactive CLI for a multi-track MIDI sequencer.
 
-Command-line shell modeled on cli.py:
+Command-line shell modeled on viplab_ip.py:
   * hyphenated commands mapped to do_* methods
   * Tab autocompletion (readline when available; a built-in key-by-key
     editor otherwise, so completion also works on Windows consoles)
@@ -21,6 +21,7 @@ import math
 import os
 import re
 import shlex
+import fractions
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import midi_ports
 import velocity
 import phrases
 import player
+import sampler
 import scales
 
 try:
@@ -53,11 +55,11 @@ COMMAND_SCRIPTS = {
 
 MAX_TRACKS = 16
 MAX_PATTERNS = 16
-MAX_PHRASES = 16
+MAX_PHRASES = 8   # phrases are f0..f7
 MAX_LFOS = 8
 
 LFO_DEFAULTS = {"frequency": 1.0, "shape": "sin", "phase": 0.0}
-LFO_SHAPES = ("sin", "tri", "saw", "square")
+LFO_SHAPES = ("sin", "tri", "saw", "square", "ramp", "random")  # ramp 0..1
 
 DEFAULT_BPM = 120
 BPM_MIN = 1
@@ -81,9 +83,11 @@ def make_prompt(menu_path):
 
 _PATH_TOKEN_RE = re.compile(
     r"(?i)^(?:t(\d+))?(?:p(\d+))?"
-    r"(?:(?:([sfvu])(\d+))|(?:sus(\d+))|(?:mt(\d+)))?$")
+    r"(?:(?:([sfvuo])(\d+))|(?:sus(\d+))|(?:mt(\d+)))?$")
 _PATH_MAX_SEQ = 9   # sequences are s0..s9
-_PATH_MAX_PHRASE = 16
+_PATH_MAX_PHRASE = MAX_PHRASES - 1   # f0..f7
+_PATH_MAX_ORDER = sampler.MAX_ORDER_LISTS - 1   # order lists are o0..o9
+PATTERN_TYPES = ("note", "cc", "loop")
 
 
 def parse_compact_path(text, track=None, pattern=None):
@@ -100,7 +104,7 @@ def parse_compact_path(text, track=None, pattern=None):
     m = _PATH_TOKEN_RE.fullmatch(token)
     if not m:
         raise ValueError(f"invalid path '{token}' (use t<n>, t<n>p<m>, "
-                         f"t<n>p<m>s<k>|f<k>|v<k>|sus<k>|mt<k>)")
+                         f"t<n>p<m>s<k>|f<k>|v<k>|sus<k>|mt<k>|o<k>)")
     t = int(m.group(1)) if m.group(1) else track
     p = int(m.group(2)) if m.group(2) else pattern
     if m.group(3):
@@ -123,14 +127,16 @@ def parse_compact_path(text, track=None, pattern=None):
         raise ValueError(f"pattern must be 1-{MAX_PATTERNS}")
     if kind == "s" and not 0 <= index <= _PATH_MAX_SEQ:
         raise ValueError(f"sequence must be s0..s{_PATH_MAX_SEQ}")
-    if kind == "f" and not 1 <= index <= _PATH_MAX_PHRASE:
-        raise ValueError(f"phrase must be f1..f{_PATH_MAX_PHRASE}")
+    if kind == "f" and not 0 <= index <= _PATH_MAX_PHRASE:
+        raise ValueError(f"phrase must be f0..f{_PATH_MAX_PHRASE}")
     if kind == "v" and not 0 <= index <= _PATH_MAX_SEQ:
         raise ValueError(f"velocity must be v0..v{_PATH_MAX_SEQ}")
     if kind == "u" and not 0 <= index <= _PATH_MAX_SEQ:
         raise ValueError(f"sustain must be sus0..sus{_PATH_MAX_SEQ}")
     if kind == "m" and not 0 <= index <= _PATH_MAX_SEQ:
         raise ValueError(f"microtiming must be mt0..mt{_PATH_MAX_SEQ}")
+    if kind == "o" and not 0 <= index <= _PATH_MAX_ORDER:
+        raise ValueError(f"order list must be o0..o{_PATH_MAX_ORDER}")
     return {"track": t, "pattern": p, "kind": kind, "index": index}
 
 
@@ -256,63 +262,137 @@ def parse_index(arg, lo, hi, what):
     return n
 
 
-_SEQ_VAR_RE = re.compile(
-    r"(?i)^([Oo]*)(\d+)((?:\*(?:(?:[+-]?(?:\d+(?:\.\d+)?))\*)?lfo\d+)+)$")
-_SEQ_VAR_TERM_RE = re.compile(
-    r"(?i)\*(?:(?P<coef>[+-]?(?:\d+(?:\.\d+)?))\*)?lfo(?P<ref>\d+)")
+def variation_term_list(variation):
+    """Variation as a tuple of terms; each term is a tuple of (coef, ref).
+
+    A term is a product, the whole variation is their sum, e.g.
+    ``127*lfo1``      -> (((127.0, 1),),)
+    ``2*lfo1*lfo2``   -> (((2.0, 1), (1.0, 2)),)
+    ``63+63*lfo1``    -> (((63.0, 1),),)      (the 63 is the entry's degree)
+    """
+    if not variation:
+        return ()
+    out = []
+    for term in variation:
+        try:
+            pairs = tuple((float(coef), int(ref)) for coef, ref in term)
+        except (TypeError, ValueError):
+            continue
+        if pairs:
+            out.append(pairs)
+    return tuple(out)
 
 
 def variation_terms(variation):
-    """Variation as a tuple of (coefficient, lfo index) pairs (empty if none)."""
-    if not variation:
-        return ()
-    return tuple((float(coef), int(ref)) for coef, ref in variation)
+    """All (coefficient, lfo index) pairs of a variation (flattened)."""
+    return tuple(pair for term in variation_term_list(variation) for pair in term)
 
 
-def variation_offset(variation, lfos, bpm, now):
-    """Offset in scale steps / CC units: round(amp x lfo1 x lfo2 x ...)."""
-    terms = variation_terms(variation)
-    if not terms:
-        return 0
-    product = 1.0
-    for coef, ref in terms:
-        try:
-            product *= lfo.evaluate(lfos or {}, ref, now, bpm)
-        except ValueError:
-            return 0
-        product *= coef
-    return int(round(product))
+def variation_offset(variation, lfos, bpm, now, unit=None):
+    """Offset in scale steps / CC units: sum of coef x lfo1 x lfo2 ...
+
+    Regular algebra: each term is a product (a term's coefficient may itself be
+    a product, e.g. 2*3*lfo1 = 6*lfo1) and the terms are added together. The
+    result is rounded to an integer unless 'unit' is given (positions are
+    fractional, so the caller passes unit=1.0 to keep the float).
+    """
+    total = 0.0
+    for term in variation_term_list(variation):
+        product = 1.0
+        for coef, ref in term:
+            try:
+                product *= lfo.evaluate(lfos or {}, ref, now, bpm)
+            except ValueError:
+                product = 0.0
+                break
+            product *= coef
+        total += product
+    if unit is None:
+        return int(round(total))
+    return total
 
 
 def variation_text(variation):
-    """Render a variation back to '<coef>*lfoN*lfoM' style text."""
+    """Render a variation: '+63*lfo1', '-2*lfo1*lfo2' (signs included)."""
     parts = []
-    for coef, ref in variation_terms(variation):
-        parts.append(f"*{coef:g}*lfo{ref}" if coef != 1 else f"*lfo{ref}")
+    for term in variation_term_list(variation):
+        coef = 1.0
+        refs = []
+        for factor, ref in term:
+            coef *= factor
+            refs.append(ref)
+        sign = "-" if coef < 0 else "+"
+        body = "*".join([f"{abs(coef):g}"] + [f"lfo{r}" for r in refs])
+        parts.append(sign + body)
     return "".join(parts)
+
+
+def parse_seq_expr(text):
+    """Parse the numeric algebra of a sequence token.
+
+    Products bind tighter than sums (regular algebra):
+      '127*lfo1'      -> (0, ((127.0, 1),))         127 x lfo1
+      '63+63*lfo1'    -> (63, ((63.0, 1),))         63 + 63 x lfo1
+      '2*lfo1*lfo2'   -> (0, ((2.0, 1), (1.0, 2)))  2 x lfo1 x lfo2
+      '30-2*lfo1'     -> (30, ((-2.0, 1),))         30 - 2 x lfo1
+      '5'             -> (5, ())                    a constant
+    Returns (constant degree, variation terms). Raises ValueError when invalid.
+    """
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("empty sequence expression")
+    constant = 0.0
+    terms = []
+    pos = 0
+    for m in re.finditer(r"([+-]?)([^+-]+)", body):
+        if m.start() != pos:  # e.g. '1++2' or a stray sign
+            raise ValueError(f"invalid sequence token '{body}' "
+                             f"(use e.g. 127*lfo1, 63+63*lfo1, 5*lfo1*lfo2)")
+        pos = m.end()
+        sign = -1.0 if m.group(1) == "-" else 1.0
+        factors = m.group(2).split("*")
+        coef = sign
+        refs = []
+        for factor in factors:
+            if not factor:
+                raise ValueError(f"invalid sequence token '{body}' "
+                                 f"(use e.g. 127*lfo1, 63+63*lfo1)")
+            if re.fullmatch(r"(?i)lfo\d+", factor):
+                refs.append(int(factor[3:]))
+                continue
+            try:
+                coef *= float(factor)
+            except ValueError:
+                raise ValueError(
+                    f"invalid sequence token '{body}': '{factor}' is not a "
+                    f"number or lfo<N> (use e.g. 127*lfo1, 63+63*lfo1)")
+        if not refs:
+            constant += coef          # a plain number: part of the degree
+        elif coef:                    # a term that multiplies an LFO
+            terms.append(((coef, refs[0]),) + tuple((1.0, r) for r in refs[1:]))
+    if pos != len(body):
+        raise ValueError(f"invalid sequence token '{body}'")
+    return constant, tuple(terms)
 
 
 def seq_token_entry(tok):
     """Parse one sequence token -> None (rest) or (degree, shift, variation).
 
-    variation is None, or a tuple of (coefficient, lfo index) pairs; any number
-    of LFOs may be multiplied together: the value moves by
-    round(amp x lfo1 x lfo2 x ...) scale steps (octaves wrap) or CC units.
+    The value of a step is ``degree + sum(coef x lfo1 x lfo2 x ...)``: products
+    first, then sums (see parse_seq_expr). For note patterns the result is a
+    scale degree (octaves wrap); for CC patterns it is the controller value.
     """
     if tok.lower() == "r":
         return None
-    m = _SEQ_VAR_RE.match(tok)
-    if m:
-        shift = m.group(1).count("O") - m.group(1).count("o")
-        terms = []
-        for coef, ref in _SEQ_VAR_TERM_RE.findall(m.group(3)):
-            terms.append((1.0 if coef in ("", None) else float(coef), int(ref)))
-        return (int(m.group(2)), shift, tuple(terms))
-    m = re.fullmatch(r"([Oo]*)(\d+)", tok)
-    if m:
-        shift = m.group(1).count("O") - m.group(1).count("o")
-        return (int(m.group(2)), shift, None)
-    raise ValueError(f"invalid sequence token {tok!r}")
+    m = re.fullmatch(r"(?i)([Oo]*)(.+)", (tok or "").strip())
+    if not m:
+        raise ValueError(f"invalid sequence token {tok!r}")
+    shift = m.group(1).count("O") - m.group(1).count("o")
+    constant, terms = parse_seq_expr(m.group(2))
+    if abs(constant - round(constant)) > 1e-9:
+        raise ValueError(f"invalid sequence token '{tok}': the constant part "
+                         f"must be a whole number ({constant:g})")
+    return (int(round(constant)), shift, terms or None)
 
 
 def _entry_text(entry):
@@ -320,9 +400,12 @@ def _entry_text(entry):
         return "r"
     degree, shift, variation = entry
     prefix = "O" * shift if shift > 0 else "o" * (-shift)
-    if variation is None:
+    if not variation:
         return f"{prefix}{degree}"
-    return f"{prefix}{degree}{variation_text(variation)}"
+    text = variation_text(variation)      # '+63*lfo1', '-2*lfo1*lfo2'
+    if degree == 0:
+        return f"{prefix}{text.lstrip('+')}"
+    return f"{prefix}{degree}{text}"
 
 
 def parse_division(text):
@@ -369,6 +452,14 @@ _HIST_VEL_ASCII = ".:-=+*#@"
 _HIST_SUS_ASCII = ".:-=+*#@"
 
 
+def _frac_text(value, max_denominator=64):
+    """Render a step value as a fraction when it is one (1/8, 3/4, 3/2)."""
+    frac = fractions.Fraction(value).limit_denominator(max_denominator)
+    if frac.denominator > 1 and abs(float(frac) - value) < 1e-9:
+        return f"{frac.numerator}/{frac.denominator}"
+    return f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+
+
 def _term_width():
     """Terminal width in columns (0 when unknown)."""
     try:
@@ -377,9 +468,18 @@ def _term_width():
         return 0
 
 
+def output_encoding():
+    """Encoding of the terminal, even while stdout is redirected to a buffer."""
+    for stream in (sys.stdout, getattr(sys, "__stdout__", None)):
+        enc = getattr(stream, "encoding", None)
+        if enc:
+            return enc
+    return "utf-8"
+
+
 def _glyph_sets():
     """Block glyphs when the output can carry them, ASCII otherwise."""
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    enc = output_encoding()
     try:
         "█".encode(enc)
         return _HIST_VEL_GLYPHS, _HIST_SUS_GLYPHS, "·"
@@ -404,7 +504,10 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
     if expr is None:
         expr = view["phrases"].get(phrase_index)
     if expr is None:
-        return [f"phrase f{phrase_index} is not configured in this pattern."]
+        if phrase_index is None:
+            return []  # no target selected: nothing to draw
+        return [f"f{phrase_index} is not configured in this pattern "
+                f"(hist f<k>|s<k> to pick another)."]
     steps = max(1, int(view["division"]))
     width = _term_width()
     column_budget = _HIST_MAX if not width else max(
@@ -413,7 +516,8 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
     steps = min(steps, _HIST_MAX, column_budget)
     step_ms = player.step_time_for(bpm, view["division"]) * 1000.0
     try:
-        plan, _ = player.flatten_phrase(expr, lambda i: view["seqs"].get(i))
+        plan, _ = player.flatten_phrase(expr, lambda kind, i: view["seqs"].get(i)
+                                        if kind == "seq" else None)
     except ValueError as e:
         return [f"cannot render phrase f{phrase_index}: {e}"]
     if not plan:
@@ -447,7 +551,8 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
         degree, shift, variation = entry
         offset = variation_offset(variation, lfos, bpm, now)
         mt_expr = view["microtimes"].get(seq_index)
-        mts.append(lfo_value(mt_expr, 0.0, -0.5, 0.5) * step_ms)
+        mts.append(lfo_value(mt_expr, 0.0, -player.MICROTIME_MAX_STEPS,
+                             player.MICROTIME_MAX_STEPS) * step_ms)
         mt_set.append(bool(mt_expr))
         if cc:
             notes.append(str(max(0, min(127, degree + offset + 12 * shift))))
@@ -456,11 +561,12 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
             continue
         index = degree + offset
         octave, pos = divmod(index, size)
-        midi = root_midi + 12 * (octave + shift) + intervals[pos]
+        midi = fold_midi(root_midi + 12 * (octave + shift) + intervals[pos])
         notes.append(midi_note_name(midi))
         vels.append(lfo_value(view["velocities"].get(seq_index), player.VELOCITY))
         suss.append(lfo_value(view["sustains"].get(seq_index),
-                              player.SUSTAIN_FRACTION, 0.0, 1.0))
+                              player.SUSTAIN_FRACTION, 0.0,
+                              player.SUSTAIN_MAX_STEPS))
 
     vel_glyphs, sus_glyphs, rest_glyph = _glyph_sets()
 
@@ -469,16 +575,23 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
             f"{cell:<{_HIST_CELL}}" if cell is not None else " " * _HIST_CELL
             for cell in cells)
 
-    def mt_cell(m, defined):
+    def mt_cell(m, defined, step_ms=step_ms):
+        """Microtiming in steps: '<1/4' early, '> 1/2' late, '|' on the grid."""
         if m is None:
             return None  # no note
         if not defined:
             return "|"  # note on the grid (no microtiming sequence)
-        if abs(m) < 0.5:
+        steps = m / step_ms if step_ms else 0.0
+        if abs(steps) < 1e-9:
             return "|  0"
-        marker = "<" if m < 0 else ">"
-        size_txt = f"{abs(m):>3.1f}" if abs(m) < 10 else f"{abs(m):>3.0f}"
-        return marker + size_txt
+        marker = "<" if steps < 0 else ">"
+        width = _HIST_CELL - 1
+        txt = _frac_text(abs(steps))          # sign is shown by the marker
+        if len(txt) > width:                   # very fine value: two decimals
+            txt = f"{abs(steps):.2f}".rstrip("0").rstrip(".") or "0"
+        if len(txt) > width:                   # still too fine: show ms
+            txt = f"{abs(m):.0f}"
+        return marker + f"{txt:>{width}}"
 
     def mark(i):
         if playhead is not None and i == playhead % steps:
@@ -497,9 +610,17 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
     vel_row = row("vel", [
         f"{vel_glyphs[min(7, int(round(v / 127.0 * 7)))]}{v:>3}"
         if v is not None else None for v in vels])
-    sus_row = row("sus", [
-        f"{sus_glyphs[min(7, int(round(s * 7)))]}{int(round(s * 100)):>3}"
-        if s is not None else None for s in suss])
+    def sus_cell(s):
+        """Sustain in steps, shown as a fraction when it is one (1/8, 3/4, 3/2)."""
+        txt = _frac_text(s)
+        if len(txt) > _HIST_CELL - 1:
+            txt = f"{s:.2f}".rstrip("0").rstrip(".") or "0"
+        glyph = sus_glyphs[min(7, int(round(min(1.0, s / 2.0) * 7)))]
+        if len(txt) <= _HIST_CELL - 1:
+            return glyph + f"{txt:>{_HIST_CELL - 1}}"
+        return f"{txt:^{_HIST_CELL}}"  # very long value: drop the glyph
+
+    sus_row = row("sus", [sus_cell(s) if s is not None else None for s in suss])
     mt_row = row("mt", [mt_cell(m, d) for m, d in zip(mts, mt_set)])
 
     # Explain all-zero LFO-linked values (stopped or still waiting for a beat).
@@ -548,7 +669,206 @@ def histogram_lines(view, lfos, bpm, now, phrase_index, live=False,
     return lines
 
 
-def describe_cc_values(entries, lfos, bpm, now):
+_HIST_POS_ROWS = 16   # most step rows drawn for a long phrase
+
+
+def loop_histogram_lines(view, lfos, bpm, now, expr=None, label=None,
+                         live=False, playhead=None, spin=0):
+    """Live histogram of the positions a loop phrase plays.
+
+    The sample's length is the horizontal axis (0 on the left, 1 on the right);
+    one row per step shows where that step starts inside the sample (marker) and
+    how much of the sample still plays (the line after it, until the next step
+    or the end of the file). Values are evaluated at 'now' (LFO snapshots).
+    """
+    if expr is None:
+        return ["Nothing to show: no order list or phrase in this pattern."]
+    try:
+        plan, _infinite = player.flatten_phrase(
+            expr, lambda kind, idx: view["orders"].get(idx)
+            if kind == "order" else None)
+    except (ValueError, phrases.PhraseError) as e:
+        return [f"cannot render {label or 'this loop'}: {e}"]
+    if not plan:
+        return [f"{label or 'this loop'} yields no steps."]
+    step_ms = player.step_time_for(bpm, view["division"]) * 1000.0
+    values = [order_entry_value(entry, lfos, bpm, now) for _i, entry in plan]
+    refs = sorted({ref for _index, entry in plan if isinstance(entry, str)
+                   for _coef, ref in variation_terms(parse_seq_expr(entry)[1])})
+
+    width = _term_width()
+    rows = len(values)
+    shown = min(rows, _HIST_POS_ROWS) if width else rows
+    truncated_rows = shown < rows
+    indent, label_w, value_w = 2, 6, 7
+    if width:
+        axis_w = max(16, width - indent - label_w - value_w - 1)
+    else:
+        axis_w = 44
+
+    # How much of the sample sounds per step: from the position to either the
+    # next step (the step time) or the end of the file, whichever comes first.
+    step_s = player.step_time_for(bpm, view["division"])
+    sample_s = 0.0
+    if view.get("sample"):
+        sample_s = sampler.sample_seconds(
+            sampler.resolve_sample(view["sample"])[0] or "")
+
+    _vel, _sus, dot = _glyph_sets()
+    try:
+        "\u25cf\u2500".encode(output_encoding())   # cp1252 lacks these
+        marker, trail = "\u25cf", "\u2500"
+    except (UnicodeEncodeError, LookupError):
+        marker, trail = "*", "-"
+    tick = "|"
+
+    def played_share(position):
+        """Fraction of the sample that sounds before the next step cuts it."""
+        remaining = max(0.0, 1.0 - position)
+        if sample_s <= 0:
+            return remaining
+        return min(remaining, step_s / sample_s)
+
+    def axis_for(position):
+        cells = [dot] * axis_w
+        if position is None:
+            return "".join(cells)
+        col = int(round(max(0.0, min(1.0, position)) * (axis_w - 1)))
+        end = position + played_share(position)
+        last = int(round(max(0.0, min(1.0, end)) * (axis_w - 1)))
+        cells[col] = marker
+        for i in range(col + 1, min(axis_w, last + 1)):
+            cells[i] = trail       # this part of the sample is heard
+        return "".join(cells)
+
+    def ruler():
+        cells = ["-"] * axis_w
+        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+            cells[int(round(frac * (axis_w - 1)))] = tick
+        return "".join(cells)
+
+    def numbers():
+        cells = [" "] * axis_w
+        for frac, text in ((0.0, "0"), (0.25, "1/4"), (0.5, "1/2"),
+                           (0.75, "3/4"), (1.0, "1")):
+            col = int(round(frac * (axis_w - 1)))
+            if frac == 0.0:
+                col = 0
+            elif frac == 1.0:
+                col = max(0, axis_w - len(text))
+            for k, ch in enumerate(text):
+                if col + k < axis_w:
+                    cells[col + k] = ch
+        return "".join(cells)
+
+    lines = []
+    head = [f"{label or 'loop'}", f"step {step_ms:g} ms", f"bpm {view['bpm']}",
+            f"division {division_to_text(view['division'])}"]
+    sample = view.get("sample")
+    if sample:
+        head.append(sample)
+    extra = ""
+    if live:
+        extra += "   (live)"
+    if playhead is not None:
+        extra += f"   step {int(playhead) % max(1, rows)}"
+        extra += "  " + _HIST_SPIN[spin % 4]
+    if truncated_rows:
+        extra += f"   (showing {shown} of {rows} steps)"
+    if refs:
+        stopped = [r for r in refs if not (lfos or {}).get(r, {}).get("running")]
+        if stopped:
+            extra += ("   (" + ", ".join(f"lfo{r} stopped -> position 0"
+                                         for r in stopped) + ")")
+    lines.append("  ".join(head) + extra)
+    lines.append("")
+    gap = " " * (indent + label_w)
+    lines.append(gap + numbers())
+    lines.append(gap + ruler())
+    for i in range(shown):
+        tag = f"s{i + 1}"
+        if playhead is not None and i == int(playhead) % max(1, rows):
+            tag = ">" + tag[1:]
+        value = values[i]
+        text = "rest" if value is None else f"{value:.3f}".rstrip("0").rstrip(".")
+        lines.append(f"{' ' * indent}{tag:<{label_w}}{axis_for(value)}"
+                     f"{text:>{value_w}}")
+    if width:
+        lines = [line[:max(1, width - 1)] for line in lines]
+    return lines
+
+
+def bars_text(steps, division):
+    """How a step count sits in 4/4 bars at a division ('' when unknown)."""
+    if not steps or not division or division < 1:
+        return ""
+    per_bar = int(division)  # 1/16 -> 16 steps per 4/4 bar
+    if steps == per_bar:
+        return "1 bar (4/4)"
+    if per_bar % steps == 0:
+        return f"{per_bar // steps} passes per 4/4 bar"
+    if steps < per_bar:
+        return f"{steps}/{per_bar} of a 4/4 bar"
+    return f"{round(steps / per_bar, 2):g} bars (4/4)"
+
+
+def cc_lfo_note(entries, lfos, bpm):
+    """Explain how the LFOs affect a CC sequence (range, saturation, stopped).
+
+    Returns '' when the sequence has no LFO terms. The range is the envelope the
+    expression can reach: +/-|product of coefficients| for bipolar shapes, and
+    one-sided for a ramp (0..1); a stopped LFO contributes exactly 0.
+    """
+    lo = hi = None
+    refs = []
+    for entry in entries:
+        if entry is None:
+            continue
+        degree, shift, variation = entry
+        if variation is None:
+            continue
+        base = degree + 12 * shift
+        step_lo = step_hi = 0.0
+        for term in variation_term_list(variation):
+            product = 1.0
+            unipolar = False
+            stopped = False
+            for coef, ref in term:
+                entry_lfo = (lfos or {}).get(ref) or {}
+                refs.append(ref)
+                if not entry_lfo.get("running", False):
+                    stopped = True
+                    break
+                if str(entry_lfo.get("shape", "sin")).lower() == "ramp":
+                    unipolar = True
+                product *= coef
+            if stopped:
+                continue  # a stopped LFO makes this whole term 0
+            if unipolar:
+                step_lo += min(0.0, product)
+                step_hi += max(0.0, product)
+            else:
+                step_lo += -abs(product)
+                step_hi += abs(product)
+        v_lo = max(0, min(127, int(round(base + step_lo))))
+        v_hi = max(0, min(127, int(round(base + step_hi))))
+        lo = v_lo if lo is None else min(lo, v_lo)
+        hi = v_hi if hi is None else max(hi, v_hi)
+    if lo is None:
+        return ""  # no LFO terms at all
+    names = ", ".join(f"lfo{n}" for n in sorted(set(refs)))
+    stopped_refs = sorted({n for n in refs
+                           if not ((lfos or {}).get(n) or {}).get("running")})
+    if stopped_refs:
+        who = ", ".join(f"lfo{n}" for n in stopped_refs)
+        return f"{who} stopped -> contributes 0 (value stays {hi})"
+    if lo == hi:
+        return (f"LFO range {lo}..{hi}: no headroom left, so {names} looks "
+                f"frozen - use a lower base, e.g. 63*30*lfo1")
+    return f"LFO range {lo}..{hi}"
+
+
+def describe_cc_values(entries, lfos, bpm, now, notes=False):
     """Render a CC sequence: current values 0..127 (or 'r' for skipped steps)."""
     offsets = sequence_offsets(entries, lfos, bpm, now)
     out = []
@@ -558,7 +878,12 @@ def describe_cc_values(entries, lfos, bpm, now):
             continue
         degree, shift, _variation = entry
         out.append(str(max(0, min(127, degree + offset + 12 * shift))))
-    return " ".join(out)
+    text = " ".join(out)
+    if notes:
+        note = cc_lfo_note(entries, lfos, bpm)
+        if note:
+            text += f"   [{note}]"
+    return text
 
 
 def seq_to_text(entries):
@@ -579,6 +904,15 @@ def scale_note_name(index, root, scale_key):
     names = scales.scale_notes(root, intervals)
     m = re.fullmatch(r"(.*?)(-?\d+)$", names[pos])
     return f"{m.group(1)}{int(m.group(2)) + octave}"
+
+
+def fold_midi(midi):
+    """Fold a note number by octaves into 0..127 (never drop a note)."""
+    while midi > 127:
+        midi -= 12
+    while midi < 0:
+        midi += 12
+    return midi
 
 
 def sequence_offsets(entries, lfos, bpm, now):
@@ -608,19 +942,78 @@ def resolve_seq_notes(entries, root, scale_key, lfos=None, bpm=DEFAULT_BPM,
             names.append("r")
             continue
         degree, shift, variation = entry
-        index = degree + offset
-        if variation is None and index >= len(scales.SCALES[scale_key]):
-            names.append("(out of scale)")
-            continue
-        if variation is None:
-            base = scales.scale_notes(root, scales.SCALES[scale_key])
-            m = re.fullmatch(r"(.*?)(-?\d+)$", base[index])
-            names.append(f"{m.group(1)}{int(m.group(2)) + shift}")
-        else:
-            name = scale_note_name(index, root, scale_key)
-            m = re.fullmatch(r"(.*?)(-?\d+)$", name)
-            names.append(f"{m.group(1)}{int(m.group(2)) + shift}")
+        # The degree is relative to the pattern's current scale, so changing
+        # the scale later just re-reads the same degree in the new scale.
+        # Degrees beyond the scale wrap into the next octave.
+        name = scale_note_name(degree + offset, root, scale_key)
+        m = re.fullmatch(r"(.*?)(-?\d+)$", name)
+        names.append(f"{m.group(1)}{int(m.group(2)) + shift}")
     return " ".join(names)
+
+
+def position_to_text(value):
+    """Compact text for a normalised position ('0.2', '0.75', '0')."""
+    return f"{float(value) % 1.0:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def order_to_text(order):
+    """Text form of an order list: positions, expressions, 'r' for a rest."""
+    return " ".join("r" if item is None else
+                    item if isinstance(item, str) else position_to_text(item)
+                    for item in order)
+
+
+def order_entry_value(entry, lfos, bpm, now):
+    """Normalised position (0..1) to play for one entry, or None for a rest.
+
+    The sample's length is 1, so an entry is a position in it: 0.2 means "start
+    at 20 %". An expression entry ('lfo1', '0.3+0.1*lfo1') is evaluated with the
+    same algebra as sequences - products first, then sums. Positions wrap
+    modulo 1, so negative values work too (-0.2 -> 0.8).
+    """
+    if entry is None:
+        return None
+    if isinstance(entry, (int, float)):
+        return float(entry) % 1.0
+    try:
+        constant, terms = parse_seq_expr(str(entry))
+    except ValueError:
+        return None
+    value = constant + variation_offset(terms or None, lfos, bpm, now,
+                                        unit=1.0)
+    return float(value) % 1.0
+
+
+def order_has_lfo(order):
+    """True when any entry of the order list is an expression."""
+    return any(isinstance(item, str) for item in (order or []))
+
+
+def text_to_order(text):
+    """Parse an order list ('0.2 0.3 r lfo1') into [float|str|None, ...]."""
+    out = []
+    for tok in (text or "").split():
+        low = tok.lower()
+        if low == "r":
+            out.append(None)
+            continue
+        try:
+            constant, terms = parse_seq_expr(low)
+        except ValueError:
+            out.append(0.0)
+            continue
+        if not terms:
+            out.append(float(constant) % 1.0)
+        else:
+            out.append(parse_seq_canonical(low))
+    return out
+
+
+def parse_seq_canonical(text):
+    """Canonical text of a sequence-style expression (whitespace stripped)."""
+    cleaned = re.sub(r"\s+", "", text)
+    parse_seq_expr(cleaned)  # validate
+    return cleaned
 
 
 def save_project_file(path, bpm, out_port, tracks, lfos=None):
@@ -673,12 +1066,17 @@ def save_project_file(path, bpm, out_port, tracks, lfos=None):
                 cfg.set(section, f"sustain-{n}", pdata["sustains"][n])
             for n in sorted(pdata.get("microtimes", {})):
                 cfg.set(section, f"microtime-{n}", pdata["microtimes"][n])
+            if pdata.get("sample"):
+                cfg.set(section, "sample", pdata["sample"])
+            for n in sorted(pdata.get("orders", {})):
+                cfg.set(section, f"order-{n}",
+                        order_to_text(pdata["orders"][n]))
             if pdata.get("type") not in (None, "note"):
                 cfg.set(section, "type", pdata["type"])
                 cfg.set(section, "controller", str(pdata.get("controller", 1)))
-            if pdata.get("division") != DEFAULT_DIVISIONS:
-                cfg.set(section, "division",
-                        division_to_text(pdata["division"]))
+            division = pdata.get("division")
+            if division is not None and division != DEFAULT_DIVISIONS:
+                cfg.set(section, "division", division_to_text(division))
     with open(path, "w", encoding="utf-8") as f:
         cfg.write(f)
     return sum(1 for section in cfg.sections()
@@ -752,6 +1150,12 @@ def load_project_file(path):
                     pdata["controller"] = cfg.getint(section, option)
                 elif option == "division":
                     pdata["division"] = parse_division(cfg.get(section, option))
+                elif option == "sample":
+                    pdata["sample"] = cfg.get(section, option).strip()
+                elif option.startswith("order-"):
+                    n = int(option[6:])
+                    pdata.setdefault("orders", {})[n] = \
+                        text_to_order(cfg.get(section, option))
             continue
         m = _LFO_SECTION_RE.fullmatch(section)
         if m:
@@ -857,15 +1261,125 @@ class SeqCompletingCmd(cmd.Cmd):
         names = [t.replace("_", "-") for t in dotags if t not in ("EOF",)]
         return [a for a in names if a.startswith(text)]
 
+    def complete(self, text, state):
+        """readline entry point: same rules as the built-in editor."""
+        if state == 0:
+            line, cursor = text, len(text)
+            if HAVE_READLINE:
+                try:
+                    line = readline.get_line_buffer()
+                    cursor = readline.get_endidx()
+                except Exception:
+                    pass
+            _, matches = self.line_candidates(line, cursor)
+            self._completion_matches = list(matches)
+        try:
+            return self._completion_matches[state]
+        except (AttributeError, IndexError):
+            return None
+
     def completedefault(self, text, line, begidx, endidx):
-        # Route to complete_<cmd> for argument completion
-        parts = line.strip().split()
-        if parts:
-            cmd_name = parts[0].replace("-", "_")
-            func = getattr(self, "complete_" + cmd_name, None)
+        """Argument completion, aware of '/' prefixes and full paths."""
+        head = line[:begidx].split()
+        root_mode = False
+        if head and head[0].startswith("/"):
+            root_mode = True
+            head = ([head[0][1:]] if len(head[0]) > 1 else []) + head[1:]
+        active = self._root_shell() if root_mode else self
+        if head:
+            func = getattr(active, "complete_" + head[0].replace("-", "_"), None)
             if func:
-                return func(text, line, begidx, endidx)
+                try:
+                    matches = func(text, line, begidx, endidx)
+                except Exception:
+                    matches = []
+                if matches:
+                    return matches
+        return active.argument_candidates(head, text)
+
+    def argument_candidates(self, head, word):
+        """Generic argument candidates for 'word' after the tokens in 'head'."""
+        first = head[0] if head else ""
+        low = word.lower()
+        # after an LFO reference: parameters, or another LFO number for cp/rm
+        if re.fullmatch(r"(?i)lfo\s*\d+", first):
+            params = ["frequency", "shape", "phase", "start", "stop", "live",
+                      "show", "help", "exit"]
+            return [p for p in params if p.startswith(low)]
+        if first.lower() in ("cp", "rm", "lfo") or low.startswith("lfo"):
+            numbers = [f"lfo{i}" for i in range(1, MAX_LFOS + 1)]
+            if low.startswith("lfo"):
+                return [n for n in numbers if n.startswith(low)]
+            if first.lower() == "lfo":
+                return numbers
+        if first.lower() in ("cp", "rm") and low.startswith("t"):
+            return [f"t{i}" for i in range(1, MAX_TRACKS + 1)
+                    if f"t{i}".startswith(low)]
+        if first.lower() == "hist":
+            options = ["live", "once", "stop", "static"]
+            options += [f"f{i}" for i in range(MAX_PHRASES)]
+            options += [f"s{i}" for i in range(10)]
+            return [o for o in options if o.startswith(low)]
+        # <path> <setting>  e.g. 't1p2 chan' or '/ t1p2 chan'
+        if re.match(r"(?i)^(?:t\d+|p\d+)", first):
+            return self.path_word_candidates(low)
+        if first.lower() in ("start", "stop"):
+            # 'start t1p1f' -> t1p1f0..f7 ; 'start f' -> f0..f7 ; 'stop t2' -> t2
+            m = re.fullmatch(r"(?i)((?:t\d+)?(?:p\d+)?)([fso])(\d*)", low)
+            if m:
+                prefix, kind = m.group(1), m.group(2).lower()
+                count = (MAX_PHRASES if kind == "f" else
+                         sampler.MAX_ORDER_LISTS if kind == "o" else 10)
+                return [f"{prefix}{kind}{i}" for i in range(count)
+                        if f"{prefix}{kind}{i}".startswith(low)]
+            names = ([f"f{i}" for i in range(MAX_PHRASES)]
+                     + [f"t{i}" for i in range(1, MAX_TRACKS + 1)]
+                     + [f"p{i}" for i in range(1, MAX_PATTERNS + 1)])
+            return [n for n in names if n.startswith(low)]
         return []
+
+    def path_word_candidates(self, low):
+        """Words that may follow a path: settings, views, leaves, commands."""
+        words = ["scale", "root", "bpm", "channel", "division", "type",
+                 "controller", "port", "select-port", "hist", "show", "start",
+                 "stop", "cp", "rm", "help"]
+        words += [f"s{i}" for i in range(10)]
+        words += [f"f{i}" for i in range(MAX_PHRASES)]
+        words += [f"v{i}" for i in range(10)]
+        words += [f"sus{i}" for i in range(10)]
+        words += [f"mt{i}" for i in range(10)]
+        return [w for w in words if w.startswith(low)]
+
+    def line_candidates(self, line, cursor):
+        """Candidates for the word ending at 'cursor' -> (start, matches).
+
+        Understands a leading '/' (run at the root, stay in this menu) and
+        path-prefixed commands, e.g. '/ t1p2 chan' -> ['channel'].
+        """
+        before = line[:cursor]
+        start = before.rfind(" ") + 1
+        word = before[start:]
+        head = before[:start].split()
+        root_mode = False
+        prefix = ""
+        if head and head[0].startswith("/"):
+            root_mode = True
+            head = ([head[0][1:]] if len(head[0]) > 1 else []) + head[1:]
+        elif word.startswith("/"):
+            root_mode = True
+            prefix, word = "/", word[1:]
+        active = self._root_shell() if root_mode else self
+        if not head:  # completing the command word itself
+            return start, [prefix + m for m in active.completenames(word)]
+        func = getattr(active, "complete_" + head[0].replace("-", "_"), None)
+        if func:
+            try:
+                matches = func(word, line, start, cursor)
+            except Exception:
+                matches = []
+            if matches:
+                return start, matches
+        return start, active.argument_candidates(head, word)
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -1099,14 +1613,14 @@ class SeqCompletingCmd(cmd.Cmd):
 
     def _complete_windows_buffer(self, buffer, cursor):
         line = "".join(buffer)
-        start = line.rfind(" ", 0, cursor) + 1
-        word = line[start:cursor]
-        matches = self.completenames(word) if start == 0 else self.completedefault(word, line, start, cursor)
+        start, matches = self.line_candidates(line, cursor)
         if not matches:
             return cursor
+        word = line[start:cursor]
         if len(matches) == 1:
             replacement = matches[0]
-            if start == 0:
+            first_word = start == 0 or (start == 1 and line[:1] == "/")
+            if first_word:
                 replacement += " "
             buffer[start:cursor] = list(replacement)
             return start + len(replacement)
@@ -1291,6 +1805,8 @@ class SeqShell(SeqCompletingCmd):
             "phrases": entry.get("phrases", {}),
             "velocities": entry.get("velocities", {}),
             "sustains": entry.get("sustains", {}),
+            "sample": entry.get("sample"),
+            "orders": entry.get("orders", {}),
         }
 
     def launch_phrase(self, track, pattern, phrase):
@@ -1313,7 +1829,9 @@ class SeqShell(SeqCompletingCmd):
             if expr is None:
                 raise LookupError(
                     f"phrase {phrase} of pattern {pattern} is no longer configured")
-            plan, infinite = player.flatten_phrase(expr, lambda idx: view["seqs"].get(idx))
+            plan, infinite = player.flatten_phrase(
+                expr, lambda kind, idx: view["seqs"].get(idx)
+                if kind == "seq" else None)
             if not plan:
                 raise ValueError("the phrase yields no steps to play")
             step_time = player.step_time_for(view["bpm"], view["division"])
@@ -1330,16 +1848,14 @@ class SeqShell(SeqCompletingCmd):
                                               self.project.get("lfos", {}),
                                               view["bpm"], now)
                     return max(0, min(127, degree + offset + 12 * shift))
-                if variation is None:
-                    if degree >= len(intervals):
-                        return None  # out of the current scale: silent step
-                    return root_midi + intervals[degree] + 12 * shift
-                # LFO-driven: whole scale steps, wrapping across octaves.
+                # Static or LFO-driven: the degree indexes the *current*
+                # scale, wrapping across octaves, so scale changes re-map it.
                 index = degree + variation_offset(
                     variation, self.project.get("lfos", {}), view["bpm"], now)
                 size = len(intervals)
                 octave, pos = divmod(index, size)
-                return root_midi + 12 * (octave + shift) + intervals[pos]
+                return fold_midi(root_midi + 12 * (octave + shift)
+                                 + intervals[pos])
 
             return (plan, infinite, step_time, resolver, view["channel"],
                     view["type"], view["controller"])
@@ -1357,7 +1873,7 @@ class SeqShell(SeqCompletingCmd):
                 return player.VELOCITY
 
         def microtime_for(seq_index, now):
-            """Per-note microtiming as a signed share of the step (-0.5..0.5)."""
+            """Per-note microtiming in steps, signed (+/-MICROTIME_MAX_STEPS)."""
             view = self._pattern_view(track, pattern)
             expr = view["microtimes"].get(seq_index)
             if not expr:
@@ -1365,19 +1881,21 @@ class SeqShell(SeqCompletingCmd):
             try:
                 return velocity.evaluate_span(
                     expr, self.project.get("lfos", {}), view["bpm"], now,
-                    -0.5, 0.5)
+                    -player.MICROTIME_MAX_STEPS,
+                    player.MICROTIME_MAX_STEPS)
             except ValueError:
                 return 0.0
 
         def sustain_for(seq_index, now):
-            """Per-note sustain as a share of the step (0..1)."""
+            """Per-note note length in steps (0..SUSTAIN_MAX_STEPS)."""
             view = self._pattern_view(track, pattern)
             expr = view["sustains"].get(seq_index)
             if not expr:
                 return player.SUSTAIN_FRACTION
             try:
-                return velocity.evaluate_fraction(
-                    expr, self.project.get("lfos", {}), view["bpm"], now)
+                return velocity.evaluate_span(
+                    expr, self.project.get("lfos", {}), view["bpm"], now,
+                    0.0, player.SUSTAIN_MAX_STEPS)
             except ValueError:
                 return player.SUSTAIN_FRACTION
 
@@ -1406,6 +1924,143 @@ class SeqShell(SeqCompletingCmd):
               f"{view0['bpm']} BPM ({kind}, step {step_time * 1000:.1f} ms). "
               f"Type 'stop' to end.")
         return pl
+
+    def launch_loop(self, track, pattern, order_index=None, phrase=None):
+        """Play a loop pattern: phrase f<k> (like note patterns) or order o<k>.
+
+        With a phrase, the phrase decides the arrangement (``f0 2*o0+o1``) and
+        the order lists are its units; without one the order list plays as-is,
+        which is shorthand for ``inf*o<k>``.
+        """
+        if not sampler.audio_available():
+            print("Error: sample playback needs Windows (winmm).")
+            return None
+        view = self._pattern_view(track, pattern)
+        if view["type"] != "loop":
+            print(f"Error: pattern {pattern} of track {track} is type "
+                  f"'{view['type']}', not 'loop' "
+                  f"(use 'type loop' in that pattern).")
+            return None
+        if not view["sample"]:
+            print(f"Error: no sample selected for pattern {pattern} of track "
+                  f"{track} (use 'sample <file>' from the samples folder).")
+            return None
+        path, err = sampler.resolve_sample(view["sample"])
+        if err:
+            print(f"Error: {err}")
+            return None
+        if phrase is None and order_index is None:
+            print("Error: give a phrase (f<k>) or an order list (o<k>).")
+            return None
+
+        def build():
+            """Fresh sample/order per cycle, so edits apply on the next pass."""
+            view = self._pattern_view(track, pattern)
+            sample = sampler.load_sample(path)
+            if phrase is None:
+                order = list((view["orders"] or {}).get(order_index) or [])
+                if not order:
+                    raise LookupError(f"order list o{order_index} of pattern "
+                                      f"{pattern} is not configured")
+                label = f"o{order_index}"
+            else:
+                expr = (view["phrases"] or {}).get(phrase)
+                if expr is None:
+                    raise LookupError(
+                        f"phrase {phrase} of pattern {pattern} is not configured")
+                plan, _infinite = player.flatten_phrase(
+                    expr, lambda kind, idx: (view["orders"] or {}).get(idx)
+                    if kind == "order" else None)
+                order = [entry for _index, entry in plan]
+                if not order:
+                    raise LookupError(f"phrase f{phrase} yields no steps")
+                label = f"f{phrase} ({expr})"
+            step_time = player.step_time_for(view["bpm"], view["division"])
+            label = (f"{label} of pattern {pattern}, track {track} "
+                     f"('{view['sample']}', {sample.duration_text()})")
+            return sample, order, step_time, label
+
+        def live_order(items, bpm):
+            """Wrap expression entries so they resolve at every step."""
+            lfos = self.project.get("lfos", {})
+            out = []
+            for item in items:
+                if isinstance(item, str):
+                    out.append(lambda now, e=item: order_entry_value(
+                        e, lfos, bpm, now))
+                else:
+                    out.append(item)
+            return out
+
+        def prepare(spec):
+            """-> ((sample, live order, step_time, label), printable text)."""
+            sample, order, step_time, label = spec
+            view = self._pattern_view(track, pattern)
+            text = order_to_text(order)
+            return ((sample, live_order(order, view["bpm"]), step_time, label),
+                    text)
+
+        try:
+            spec, order_text = prepare(build())
+        except (ValueError, OSError, LookupError, phrases.PhraseError) as e:
+            print(f"Error: {e}")
+            return None
+        self.stop_pattern(track, pattern, announce=False)
+        sample, order, step_time, label = spec
+        key = ((track, pattern, phrase) if phrase is not None
+               else (track, pattern, "o", order_index))
+        pl = sampler.LoopPlayer(lambda: prepare(build())[0], key=key)
+        self.playback[key] = pl
+        pl.start()
+        what = f"f{phrase}" if phrase is not None else f"o{order_index}"
+        bars = bars_text(len(order), view["division"])
+        bars_txt = f" = {bars}" if bars else ""
+        print(f"Playing {label}: {len(order)} steps "
+              f"({order_text}) = positions in the sample, {view['bpm']} BPM, "
+              f"step {step_time * 1000:.1f} ms{bars_txt}, looped. "
+              f"Type 'stop {what}' to end.")
+        return pl
+
+    def launch(self, track, pattern, kind, index):
+        """Start playback of a phrase (f) or loop order (o), by pattern type."""
+        if kind == "o":
+            return self.launch_loop(track, pattern, order_index=index)
+        if self._pattern_view(track, pattern)["type"] == "loop":
+            return self.launch_loop(track, pattern, phrase=index)
+        return self.launch_phrase(track, pattern, index)
+
+    def stop_target(self, track, pattern, kind, index, announce=True):
+        """Stop a phrase or loop order, whichever the pattern type uses."""
+        if kind == "o":
+            return self.stop_loop(track, pattern, index, announce=announce)
+        if self._pattern_view(track, pattern)["type"] == "loop":
+            return self.stop_loop(track, pattern, None, phrase=index,
+                                  announce=announce)
+        return self.stop_phrase(track, pattern, index, announce=announce)
+
+    def stop_loop(self, track, pattern, order_index, phrase=None,
+                  announce=True):
+        """Stop a running loop order list or loop phrase."""
+        if phrase is not None:
+            key = (track, pattern, phrase)
+            what = f"f{phrase}"
+        else:
+            key = (track, pattern, "o", order_index)
+            what = f"o{order_index}"
+        pl = self.playback.pop(key, None)
+        if pl is None:
+            if announce:
+                print(f"No loop playing for {what} of pattern "
+                      f"{pattern}, track {track}.")
+            return False
+        try:
+            pl.stop()
+        except Exception:
+            pass
+        sampler.stop_audio()
+        if announce:
+            print("Loop stopped.")
+        return True
 
     def stop_pattern(self, track, pattern, announce=True):
         """Stop any phrase currently playing for a track/pattern."""
@@ -1441,28 +2096,32 @@ class SeqShell(SeqCompletingCmd):
         return True
 
     def do_start(self, arg):
-        "Play a phrase: start t<track>p<pattern>f<phrase> (e.g. start t1p1f1)"
+        """Play a phrase or a loop order: start t1p1f1 / start t1p1o0"""
         try:
             path = parse_compact_path(arg, None, None)
-            if path["kind"] != "f" or path["pattern"] is None:
-                raise ValueError("use start t<n>p<m>f<k> (e.g. start t1p1f1)")
+            if path["pattern"] is None or path["kind"] not in ("f", "o"):
+                raise ValueError("use start t<n>p<m>f<k> (phrase) or "
+                                 "t<n>p<m>o<k> (loop order)")
         except ValueError as e:
             print(f"Error: {e}")
             return
-        self.launch_phrase(path["track"], path["pattern"], path["index"])
+        self.launch(path["track"], path["pattern"], path["kind"],
+                    path["index"])
 
     def do_stop(self, arg):
-        "Stop a phrase: stop t<track>p<pattern>f<phrase>"
+        """Stop a phrase or a loop order: stop t1p1f1 / stop t1p1o0"""
         try:
             path = parse_compact_path(arg, None, None)
-            if path["kind"] != "f" or path["pattern"] is None:
-                raise ValueError("use stop t<n>p<m>f<k> (e.g. stop t1p1f1)")
+            if path["pattern"] is None or path["kind"] not in ("f", "o"):
+                raise ValueError("use stop t<n>p<m>f<k> (phrase) or "
+                                 "t<n>p<m>o<k> (loop order)")
         except ValueError as e:
             print(f"Error: {e}")
             return
-        self.stop_phrase(path["track"], path["pattern"], path["index"])
+        self.stop_target(path["track"], path["pattern"], path["kind"],
+                         path["index"])
 
-    def _pattern_block(self, track, pattern, running):
+    def _pattern_block(self, track, pattern, running, running_orders=()):
         """Lines describing one pattern and its leaves (color marks running)."""
         view = self._pattern_view(track, pattern)
         seqs = view["seqs"]
@@ -1470,23 +2129,49 @@ class SeqShell(SeqCompletingCmd):
         velocities = view["velocities"]
         sustains = view["sustains"]
         microtimes = view["microtimes"]
+        orders = view["orders"]
+        sample = view["sample"]
+        color_used = False
+        is_loop = view["type"] == "loop"
         if not seqs and not phrases and not velocities and not sustains \
-                and not microtimes:
+                and not microtimes and not orders and not sample:
             return None
         port_text = f"{view['port']}" if view["port"] else "(none selected)"
-        what = ("type note" if view["type"] != "cc"
-                else f"type CC{view['controller']}")
+        what = ("type note" if view["type"] not in ("cc", "loop")
+                else f"type CC{view['controller']}" if view["type"] == "cc"
+                else "type loop")
         block = [f"  Pattern {pattern}: {what}, scale {view['scale']}, root "
                  f"{view['root'].name()}, channel {view['channel']}, "
                  f"bpm {view['bpm']}, "
                  f"division {division_to_text(view['division'])}, "
                  f"port {port_text}"]
+        if is_loop:
+            step_ms = division_step_ms(view["bpm"], view["division"])
+            seconds = (sampler.sample_seconds(
+                sampler.resolve_sample(sample)[0]) if sample else 0.0)
+            block.append(f"    sample: {sample or '(none selected)'}  "
+                         f"[{seconds:.2f} s, positions 0..1, step "
+                         f"{step_ms:g} ms, {sampler.samples_dir()}]")
+            for n in sorted(orders):
+                line = (f"    o{n}: {order_to_text(orders[n])}   "
+                        f"({len(orders[n])} steps)")
+                if (track, pattern, n) in running_orders:
+                    line = paint_green(line)
+                    color_used = True
+                block.append(line)
+            for n in sorted(phrases):
+                line = f"    f{n}: {phrases[n]}"
+                if (track, pattern, n) in running:
+                    line = paint_green(line)
+                    color_used = True
+                block.append(line)
+            return block, color_used
         for n in sorted(seqs):
             seq = seqs[n]
             if view["type"] == "cc":
                 notes_text = describe_cc_values(
                     seq, self.project.get('lfos', {}), view['bpm'],
-                    time.monotonic())
+                    time.monotonic(), notes=True)
             else:
                 notes_text = resolve_seq_notes(
                     seq, view['root'], view['scale'],
@@ -1512,9 +2197,8 @@ class SeqShell(SeqCompletingCmd):
         for n in sorted(microtimes):
             if n not in seqs:
                 block.append(f"    mt{n}: {microtimes[n]}")
-        color_used = False
         for n in sorted(phrases):
-            line = f"    phrase-{n}: {phrases[n]}"
+            line = f"    f{n}: {phrases[n]}"
             if (track, pattern, n) in running:
                 line = paint_green(line)
                 color_used = True
@@ -1522,7 +2206,7 @@ class SeqShell(SeqCompletingCmd):
         return block, color_used
 
     def do_show(self, arg):
-        "Show the configuration tree, or a path: show [t<n>[p<m>[s<k>|f<k>]]]"
+        "Show the configuration tree, or a path: show [t<n>[p<m>[s<k>|f<k>|o<k>]]]"
         tracks = self.project.get("tracks", {})
         text = (arg or "").strip()
         selected = None
@@ -1534,12 +2218,42 @@ class SeqShell(SeqCompletingCmd):
                 print("Usage: show                     (whole configuration)")
                 print("       show t<n>                 (one track)")
                 print("       show t<n>p<m>             (one pattern)")
-                print("       show t<n>p<m>s<k>|f<k>|v<k>|sus<k>|mt<k>  (one leaf)")
+                print("       show t<n>p<m>s<k>|f<k>|v<k>|sus<k>|mt<k>|o<k>  (one leaf)")
                 return
 
-        running = {(t, p, ph) for (t, p, ph), pl in self.playback.items() if pl.running}
+        running = set()
+        running_orders = set()
+        for key, pl in self.playback.items():
+            if not getattr(pl, "running", False):
+                continue
+            if len(key) == 4 and key[2] == "o":
+                running_orders.add((key[0], key[1], key[3]))
+            elif len(key) == 3:
+                running.add(key)
 
         # Leaf views -----------------------------------------------------
+        if selected and selected["kind"] == "o":
+            track, pattern = selected["track"], selected["pattern"]
+            view = self._pattern_view(track, pattern)
+            n = selected["index"]
+            orders = view["orders"]
+            print(f"\nTrack {track}, Pattern {pattern} "
+                  f"(type {view['type']}, division "
+                  f"{division_to_text(view['division'])}, positions 0..1):")
+            if n not in orders:
+                print(f"  o{n} of t{track}p{pattern} is not configured.\n")
+                return
+            line = (f"  o{n}: {order_to_text(orders[n])}   "
+                    f"({len(orders[n])} steps)")
+            if (track, pattern, n) in running_orders:
+                line = paint_green(line)
+                print(line)
+                print(f"{paint_green('green')} = currently playing")
+            else:
+                print(line)
+            print()
+            return
+
         if selected and selected["kind"] in ("s", "f", "v", "u", "m"):
             track, pattern = selected["track"], selected["pattern"]
             if track not in tracks or pattern not in tracks[track]:
@@ -1548,6 +2262,12 @@ class SeqShell(SeqCompletingCmd):
             view = self._pattern_view(track, pattern)
             if view["type"] == "cc":
                 desc = f"type CC{view['controller']}, values 0-127"
+            elif view["type"] == "loop":
+                length = (sampler.sample_seconds(
+                    sampler.resolve_sample(view["sample"])[0])
+                    if view["sample"] else 0.0)
+                desc = (f"type loop, sample {view['sample'] or '(none)'}, "
+                        f"{length:.2f} s")
             else:
                 desc = f"{view['scale']} on {view['root'].name()}"
             head = f"Track {track}, Pattern {pattern} ({desc}):"
@@ -1585,7 +2305,7 @@ class SeqShell(SeqCompletingCmd):
                 if view["type"] == "cc":
                     notes_text = describe_cc_values(
                         seq, self.project.get('lfos', {}), view['bpm'],
-                        time.monotonic())
+                        time.monotonic(), notes=True)
                 else:
                     notes_text = resolve_seq_notes(
                         seq, view['root'], view['scale'],
@@ -1594,9 +2314,9 @@ class SeqShell(SeqCompletingCmd):
                 print(f"  seq{n}: {seq_to_text(seq):<28} -> {notes_text}")
             else:
                 if n not in view["phrases"]:
-                    print(f"\nphrase-{n} of t{track}p{pattern} is not configured.\n")
+                    print(f"\nf{n} of t{track}p{pattern} is not configured.\n")
                     return
-                line = f"  phrase-{n}: {view['phrases'][n]}"
+                line = f"  f{n}: {view['phrases'][n]}"
                 if (track, pattern, n) in running:
                     line = paint_green(line)
                 print(f"\n{head}")
@@ -1609,7 +2329,8 @@ class SeqShell(SeqCompletingCmd):
         # Tree views -----------------------------------------------------
         if selected and selected["pattern"] is not None:
             track, pattern = selected["track"], selected["pattern"]
-            built = self._pattern_block(track, pattern, running)
+            built = self._pattern_block(track, pattern, running,
+                                        running_orders)
             if built is None:
                 print(f"\n(nothing configured for t{track}p{pattern})\n")
                 return
@@ -1638,7 +2359,8 @@ class SeqShell(SeqCompletingCmd):
         for track in track_ids:
             pattern_blocks = []
             for pattern in sorted(tracks[track]):
-                built = self._pattern_block(track, pattern, running)
+                built = self._pattern_block(track, pattern, running,
+                                            running_orders)
                 if built is None:
                     continue
                 block, colored = built
@@ -1668,21 +2390,24 @@ class SeqShell(SeqCompletingCmd):
         print(f"  {'t<n>':<20} - enter a track menu (n = 1-16)")
         print(f"  {'t<n>p<m>':<20} - enter a pattern menu (e.g. t1p1)")
         print(f"  {'t<n>p<m>s<k> [deg...]':<20} - set a sequence (s0..s9) e.g. t1p1s1 0 0 O1")
-        print(f"  {'t<n>p<m>f<k> <expr>':<20} - define a phrase (f1..f16) e.g. t1p1f1 inf*s0")
+        print(f"  {'t<n>p<m>f<k> <expr>':<20} - define a phrase (f0..f7) e.g. t1p1f0 inf*s0")
         print(f"  {'t<n>p<m> scale|root|bpm|channel':<20} - edit a pattern setting")
         print(f"  {'t<n>p<m> division 1/16':<20} - step note value (1, 1/2, 1/3, 1/16 ...)")
-        print(f"  {'t<n>p<m> type note|CC':<20} - pattern kind (default note)")
-        print(f"  {'show [t<n>[p<m>[s<k>|f<k>|v<k>]]]':<20} - config tree or one leaf")
+        print(f"  {'t<n>p<m> type note|CC|loop':<20} - pattern kind (default note)")
+        print(f"  {'t<n>p<m> sample <file.wav>':<20} - loop pattern: choose a wav from samples/")
+        print(f"  {'t<n>p<m>o<k> <slice...>':<20} - loop slice order, e.g. t1p1o0 0 1 4 2 5")
+        print(f"  {'show [t<n>[p<m>[s<k>|f<k>|o<k>]]]':<20} - config tree or one leaf")
         print(f"  {'<path> ...':<20} - edit by path, e.g. t1p1s0 0 0 5, "
               f"t1p1v0 64+0.4*lfo1, t1p1sus0 0.5 or t1p1mt0 -0.05")
         print(f"  {'start t<n>p<m>f<k>':<20} - play a phrase (e.g. start t1p1f1)")
-        print(f"  {'stop t<n>p<m>f<k>':<20} - stop a phrase (e.g. stop t1p1f1)")
+        print(f"  {'start t<n>p<m>o<k>':<20} - play a loop order (e.g. start t1p1o0)")
+        print(f"  {'stop t<n>p<m>f<k>|o<k>':<20} - stop a phrase or loop order")
         print(f"  {'lfo <n>':<20} - enter an LFO definition menu (n = 1-8)")
         print(f"  {'lfo<n> start|stop':<20} - start or stop an LFO from here (e.g. lfo3 start)")
         print(f"  {'status-lfo':<20} - show the parameters of all started LFOs")
-        print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, sequence or phrase")
+        print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, leaf or LFO (cp lfo1 lfo2)")
         print(f"  {'rm <path>|lfo<n>':<20} - delete a track/pattern/sequence/phrase, reset an LFO or a setting")
-        print(f"  {'panic':<20} - stop all phrases and silence all MIDI outputs")
+        print(f"  {'panic':<20} - stop all playback (phrases, loops) and silence outputs")
         print(f"  {'save [<file>]':<20} - save the whole configuration to a .cfg file")
         print(f"  {'load [<file>]':<20} - load the whole configuration from a .cfg file")
         print(f"  {'help':<20} - show this help (help <command> for details)")
@@ -1692,18 +2417,21 @@ class SeqShell(SeqCompletingCmd):
             print(f"  Output port: {self.out_port}")
             print()
         print("Context:\n  Tracks hold 16 patterns each; patterns hold sequences\n"
-              "  (s0..s9) and phrases (f1..f16). Shortcuts: t=track, p=pattern,\n"
-              "  s=sequence, f=phrase.")
+              "  (s0..s9) and phrases (f0..f7). Loop patterns add order lists\n"
+              "  (o0..o9) of positions in the sample. Shortcuts: t=track,\n"
+              "  p=pattern,\n"
+              "  s=sequence, f=phrase, o=order.")
         print()
 
     def _stop_all_playback(self):
-        """Stop every running phrase (used when leaving the program)."""
+        """Stop every running player (phrases, loops) - exit and panic."""
         for key, pl in list(self.playback.items()):
             try:
                 pl.stop()
             except Exception:
                 pass
             self.playback.pop(key, None)
+        sampler.stop_audio()
 
     def panic(self):
         """Stop all phrases and send MIDI All Sound Off / All Notes Off."""
@@ -1713,18 +2441,18 @@ class SeqShell(SeqCompletingCmd):
         self._stop_all_playback()
         sent = player.panic_ports(ports)
         if count or sent:
-            print(f"Panic: stopped {count} phrase{'s' if count != 1 else ''}; "
-                  f"sent All Sound Off on {len(sent)} port"
-                  f"{'s' if len(sent) != 1 else ''}.")
+            print(f"Panic: stopped {count} playback{'s' if count != 1 else ''} "
+                  f"(phrases/loops, audio silenced); sent All Sound Off on "
+                  f"{len(sent)} port{'s' if len(sent) != 1 else ''}.")
         else:
             print("Panic: nothing playing.")
 
     def do_panic(self, arg):
-        "Stop all phrases and silence all MIDI outputs"
+        "Stop everything (phrases, loops) and silence MIDI/audio outputs"
         self.panic()
 
     def do_cp(self, arg):
-        "Copy a track, pattern, sequence or phrase: cp <source> <destination>"
+        "Copy a track, pattern, leaf or LFO: cp <source> <destination>"
         parts = (arg or "").split()
         if len(parts) != 2:
             print("Usage: cp <source> <destination>")
@@ -1734,7 +2462,23 @@ class SeqShell(SeqCompletingCmd):
             print("       cp t1p1f1 t3p4f3     copy a phrase")
             print("       cp t1p1v1 t3p4v4     copy a velocity")
             print("       cp t1p1sus1 t3p4sus4 copy a sustain")
-            print("       cp t1p1mt1 t3p4mt4     copy a microtiming")
+            print("       cp t1p1mt1 t3p4mt4   copy a microtiming")
+            print("       cp lfo1 lfo2         copy all LFO parameters")
+            print("       cp /lfo1 /lfo2       same, from any menu")
+            return
+        # LFO operands, Unix-style ('lfo1' or '/lfo1', any menu).
+        operands = [re.sub(r"^/+", "", part) for part in parts]
+        m = [re.fullmatch(r"(?i)lfo\s*(\d+)", op) for op in operands]
+        if any(m):
+            if not all(m):
+                print("Error: both operands must be LFOs, e.g. cp lfo1 lfo2.")
+                return
+            src, dst = (int(hit.group(1)) for hit in m)
+            for n in (src, dst):
+                if not 1 <= n <= MAX_LFOS:
+                    print(f"Error: LFO number must be between 1 and {MAX_LFOS}.")
+                    return
+            self.copy_lfo(src, dst)
             return
         try:
             src = parse_compact_path(parts[0], None, None)
@@ -1746,16 +2490,23 @@ class SeqShell(SeqCompletingCmd):
 
         # --- whole track ------------------------------------------------
         if src["pattern"] is None and dst["pattern"] is None:
-            if src["track"] == dst["track"]:
-                print("Error: source and destination are the same.")
+            st, dt = src["track"], dst["track"]
+            source = tracks.get(st) or {}
+            if st == dt:
+                print(f"Copied track t{st} -> t{dt} "
+                      f"({len(source)} pattern{'s' if len(source) != 1 else ''}); "
+                      f"unchanged.")
                 return
-            source = tracks.get(src["track"])
-            if not source:
-                print(f"Error: track {src['track']} has no configuration to copy.")
-                return
-            tracks[dst["track"]] = copy.deepcopy(source)
-            print(f"Copied track t{src['track']} -> t{dst['track']} "
-                  f"({len(source)} pattern{'s' if len(source) != 1 else ''}).")
+            for pattern in list(tracks.get(dt, {})):
+                self.stop_pattern(dt, pattern, announce=False)
+            if source:
+                tracks[dt] = copy.deepcopy(source)
+                print(f"Copied track t{st} -> t{dt} "
+                      f"({len(source)} pattern{'s' if len(source) != 1 else ''}).")
+            else:
+                tracks.pop(dt, None)  # an empty source clears the destination
+                print(f"Copied track t{st} -> t{dt}; t{dt} is empty "
+                      f"(t{st} has nothing configured).")
             return
 
         # --- pattern ----------------------------------------------------
@@ -1764,57 +2515,94 @@ class SeqShell(SeqCompletingCmd):
                 print("Error: source and destination must both be tracks, both "
                       "patterns, both sequences or both phrases.")
                 return
-            if (src["track"], src["pattern"]) == (dst["track"], dst["pattern"]):
-                print("Error: source and destination are the same.")
+            st, sp = src["track"], src["pattern"]
+            dt, dp = dst["track"], dst["pattern"]
+            entry = tracks.get(st, {}).get(sp) or {}
+            if (st, sp) == (dt, dp):
+                print(f"Copied pattern t{st}p{sp} -> t{dt}p{dp}; unchanged.")
                 return
-            entry = tracks.get(src["track"], {}).get(src["pattern"])
-            if not entry:
-                print(f"Error: pattern t{src['track']}p{src['pattern']} "
-                      f"is not configured.")
-                return
-            tracks.setdefault(dst["track"], {})[dst["pattern"]] = \
-                copy.deepcopy(entry)
-            print(f"Copied pattern t{src['track']}p{src['pattern']} -> "
-                  f"t{dst['track']}p{dst['pattern']}.")
+            self.stop_pattern(dt, dp, announce=False)
+            if entry:
+                tracks.setdefault(dt, {})[dp] = copy.deepcopy(entry)
+                print(f"Copied pattern t{st}p{sp} -> t{dt}p{dp}.")
+            else:
+                tracks.get(dt, {}).pop(dp, None)
+                self._prune_pattern(tracks, dt, dp)
+                print(f"Copied pattern t{st}p{sp} -> t{dt}p{dp}; "
+                      f"t{dt}p{dp} reset to defaults (t{st}p{sp} is empty).")
             return
 
-        # --- sequence / phrase ------------------------------------------
-        if src["kind"] != dst["kind"] or src["kind"] not in ("s", "f", "v", "u", "m"):
+        # --- sequence / phrase / velocity / sustain / microtiming --------
+        if src["kind"] != dst["kind"] or src["kind"] not in ("s", "f", "v", "u", "m", "o"):
             print("Error: source and destination must both be tracks, both "
                   "patterns, both sequences, both phrases, both velocities, "
                   "both sustains or both microtimings.")
             return
+        bucket = {"s": "seqs", "f": "phrases", "v": "velocities",
+                  "u": "sustains", "m": "microtimes", "o": "orders"}[src["kind"]]
+        kind_name = {"s": "sequence", "f": "phrase", "v": "velocity",
+                     "u": "sustain", "m": "microtiming",
+                     "o": "order list"}[src["kind"]]
+        shown = {"s": f"s{src['index']}", "f": f"f{src['index']}",
+                 "v": f"v{src['index']}", "u": f"sus{src['index']}",
+                 "m": f"mt{src['index']}", "o": f"o{src['index']}"}[src["kind"]]
+        dest_shown = {"s": f"s{dst['index']}", "f": f"f{dst['index']}",
+                      "v": f"v{dst['index']}", "u": f"sus{dst['index']}",
+                      "m": f"mt{dst['index']}", "o": f"o{dst['index']}"}[dst["kind"]]
+        src_name = f"t{src['track']}p{src['pattern']}{shown}"
+        dst_name = f"t{dst['track']}p{dst['pattern']}{dest_shown}"
+        source_map = (tracks.get(src["track"], {}).get(src["pattern"], {})
+                      .get(bucket, {}))
         if (src["track"], src["pattern"], src["kind"], src["index"]) == \
                 (dst["track"], dst["pattern"], dst["kind"], dst["index"]):
-            print("Error: source and destination are the same.")
+            print(f"Copied {kind_name} {src_name} -> {dst_name}; unchanged.")
             return
-        bucket = {"s": "seqs", "f": "phrases", "v": "velocities",
-                  "u": "sustains", "m": "microtimes"}[src["kind"]]
-        label = f"{src['kind']}{src['index']}"
-        source_entry = tracks.get(src["track"], {}).get(src["pattern"], {})
-        if src["index"] not in source_entry.get(bucket, {}):
-            print(f"Error: {label} of t{src['track']}p{src['pattern']} "
-                  f"is not configured.")
-            return
-        dest_entry = tracks.setdefault(dst["track"], {}).setdefault(
-            dst["pattern"], {})
-        if not dest_entry.get("scale"):
-            dest_entry.setdefault("scale", "chromatic")
-            dest_entry.setdefault("root", "C4")
-            dest_entry.setdefault("channel", DEFAULT_CHANNEL)
-            dest_entry.setdefault("bpm", self.bpm)
-            dest_entry.setdefault("bpm-inherited", True)
-        dest_entry.setdefault(bucket, {})[dst["index"]] = \
-            copy.deepcopy(source_entry[bucket][src["index"]])
-        kind_name = {"s": "sequence", "f": "phrase", "v": "velocity",
-                     "u": "sustain", "m": "microtiming"}[src["kind"]]
-        shown = label if src["kind"] not in ("u", "m") else (
-            f"sus{src['index']}" if src["kind"] == "u" else f"mt{src['index']}")
-        dest_shown = (f"{dst['kind']}{dst['index']}" if dst["kind"] not in ("u", "m")
-                      else (f"sus{dst['index']}" if dst["kind"] == "u"
-                            else f"mt{dst['index']}"))
-        print(f"Copied {kind_name} t{src['track']}p{src['pattern']}{shown} -> "
-              f"t{dst['track']}p{dst['pattern']}{dest_shown}.")
+        # A sequence carries its velocity / sustain / microtiming entries
+        # (same index): copying s0 -> s1 also copies v0 -> v1, sus0 -> sus1,
+        # mt0 -> mt1, and clears destination companions the source lacks.
+        companions = ("velocities", "sustains", "microtimes") \
+            if src["kind"] == "s" else ()
+        source_entry = tracks.get(src["track"], {}).get(src["pattern"]) or {}
+        dest_entry = tracks.get(dst["track"], {}).get(dst["pattern"])
+        copied_with = []
+        for bucket_name in companions:
+            if src["index"] in (source_entry.get(bucket_name) or {}):
+                copied_with.append(bucket_name)
+
+        if src["index"] in source_map or copied_with:
+            dest_entry = tracks.setdefault(dst["track"], {}).setdefault(
+                dst["pattern"], {})
+            if src["index"] in source_map:
+                dest_entry.setdefault(bucket, {})[dst["index"]] = \
+                    copy.deepcopy(source_map[src["index"]])
+            elif dest_entry.get(bucket, {}).pop(dst["index"], None) is not None:
+                pass  # companion-only copy: no sequence text to write
+            written = []
+            for bucket_name in companions:
+                target = dest_entry.setdefault(bucket_name, {})
+                if src["index"] in (source_entry.get(bucket_name) or {}):
+                    target[dst["index"]] = copy.deepcopy(
+                        source_entry[bucket_name][src["index"]])
+                    written.append({"velocities": f"v{dst['index']}",
+                                    "sustains": f"sus{dst['index']}",
+                                    "microtimes": f"mt{dst['index']}"}[bucket_name])
+                else:
+                    target.pop(dst["index"], None)
+                if not target:
+                    dest_entry.pop(bucket_name, None)
+            extra = f" ({', '.join(written)} too)" if written else ""
+            print(f"Copied {kind_name} {src_name} -> {dst_name}{extra}.")
+        else:
+            if dest_entry:
+                for name, bucket_name in (("seqs", bucket),) + tuple(
+                        (b, b) for b in companions):
+                    mapping = dest_entry.get(bucket_name) or {}
+                    mapping.pop(dst["index"], None)
+                    if not mapping:
+                        dest_entry.pop(bucket_name, None)
+                self._prune_pattern(tracks, dst["track"], dst["pattern"])
+            print(f"Copied {kind_name} {src_name} -> {dst_name}; "
+                  f"{dst_name} cleared ({src_name} is not configured).")
 
     def _prune_pattern(self, tracks, track, pattern):
         """Drop empty pattern/track entries after a deletion."""
@@ -1842,6 +2630,38 @@ class SeqShell(SeqCompletingCmd):
             print(f"Reset LFO {n} {param} to {shown}{suffix}.")
         return shown
 
+    def copy_lfo(self, src, dst):
+        """Copy one LFO onto another; defaults count as values (cp is total)."""
+        lfos = self.project.setdefault("lfos", {})
+        source = lfos.get(src) or {}
+        target = lfos.get(dst) or {}
+        was_running = bool(source.get("running"))
+        values = {key: source.get(key, default)
+                  for key, default in LFO_DEFAULTS.items()}
+        summary = ("frequency " + lfo.param_to_text(values["frequency"])
+                   + f", shape {values['shape']}"
+                   + f", phase {float(values['phase']):g}")
+        # Nothing to do? (same LFO, or identical parameters) -- still a success.
+        current = {key: target.get(key, default)
+                   for key, default in LFO_DEFAULTS.items()}
+        if src == dst or (current == values
+                          and bool(target.get("running")) == was_running):
+            state = ("running" if was_running else "stopped")
+            note = "unchanged" if src == dst else "no change"
+            print(f"Copied LFO {src} -> LFO {dst} ({summary}); "
+                  f"{state}, {note}.")
+            return
+        if values == dict(LFO_DEFAULTS):
+            lfos.pop(dst, None)  # all-default source: destination becomes default
+        else:
+            lfos[dst] = dict(values)
+        self._lfo_set_running(dst, was_running)
+        if was_running:
+            print(f"Copied LFO {src} -> LFO {dst} ({summary}); "
+                  f"LFO {dst} started (LFO {src} is running).")
+        else:
+            print(f"Copied LFO {src} -> LFO {dst} ({summary}); LFO {dst} stopped.")
+
     def reset_lfo(self, n, announce=True):
         """Reset one global LFO to its defaults (and stop it)."""
         entry = self.project.setdefault("lfos", {}).get(n)
@@ -1864,6 +2684,7 @@ class SeqShell(SeqCompletingCmd):
             print("       rm t1p1v1             remove a velocity")
             print("       rm t1p1sus1           remove a sustain")
             print("       rm t1p1mt1            remove a microtiming")
+            print("       rm t1p1o1             remove a loop order list")
             print("       rm t1p1 scale|root|bpm|channel|division|type|controller|port")
             print("       rm lfo1               reset an LFO (rm lfo = all of them)")
             return
@@ -1919,10 +2740,12 @@ class SeqShell(SeqCompletingCmd):
             keys = {"scale": ["scale"], "root": ["root"], "channel": ["channel"],
                     "bpm": ["bpm", "bpm-inherited"], "division": ["division"],
                     "type": ["type", "controller"], "controller": ["controller"],
-                    "port": ["port"], "select-port": ["port"]}
+                    "port": ["port"], "select-port": ["port"],
+                    "sample": ["sample"]}
             if verb not in keys:
                 print(f"Error: unknown setting '{verb}'. Use scale, root, bpm, "
-                      f"channel or port.")
+                      f"channel, division, type, controller, sample "
+                      f"or port.")
                 return
             if not entry:
                 print(f"Error: pattern t{track}p{pattern} is not configured.")
@@ -1936,7 +2759,8 @@ class SeqShell(SeqCompletingCmd):
                         "division": division_to_text(DEFAULT_DIVISIONS),
                         "type": "note", "controller": "1",
                         "port": "inherits the global port",
-                        "select-port": "inherits the global port"}
+                        "select-port": "inherits the global port",
+                        "sample": "no sample"}
             print(f"Reset {verb} of t{track}p{pattern} ({defaults[verb]}).")
             return
 
@@ -1985,6 +2809,14 @@ class SeqShell(SeqCompletingCmd):
             del entry["microtimes"][path["index"]]
             self._prune_pattern(tracks, track, pattern)
             print(f"Removed microtiming t{track}p{pattern}mt{path['index']}.")
+        elif path["kind"] == "o":
+            if path["index"] not in entry.get("orders", {}):
+                print(f"Error: o{path['index']} of t{track}p{pattern} "
+                      f"is not configured.")
+                return
+            del entry["orders"][path["index"]]
+            self._prune_pattern(tracks, track, pattern)
+            print(f"Removed order list t{track}p{pattern}o{path['index']}.")
         else:
             del tracks[track][pattern]
             self._prune_pattern(tracks, track, pattern)
@@ -2010,7 +2842,7 @@ class SeqShell(SeqCompletingCmd):
         kind, index = path["kind"], path["index"]
         if rest and kind is None:
             first_word = rest.split()[0]
-            m = re.fullmatch(r"(?i)([sfv])(\d+)", first_word)
+            m = re.fullmatch(r"(?i)([sfvo])(\d+)", first_word)
             if m:
                 kind, index = m.group(1).lower(), int(m.group(2))
                 rest = rest[len(first_word):].strip()
@@ -2036,8 +2868,8 @@ class SeqShell(SeqCompletingCmd):
                 shell.show_sequence(index)
             return
         if kind == "f":
-            if not 1 <= index <= _PATH_MAX_PHRASE:
-                raise ValueError(f"phrase must be f1..f{_PATH_MAX_PHRASE}")
+            if not 0 <= index <= _PATH_MAX_PHRASE:
+                raise ValueError(f"phrase must be f0..f{_PATH_MAX_PHRASE}")
             shell.set_phrase(index, rest)
             return
         if kind == "v":
@@ -2048,6 +2880,18 @@ class SeqShell(SeqCompletingCmd):
             return
         if kind == "m":
             shell.set_microtime(index, rest)
+            return
+        if kind == "o":
+            if not 0 <= index <= _PATH_MAX_ORDER:
+                raise ValueError(f"order list must be o0..o{_PATH_MAX_ORDER}")
+            if rest.lower() in ("sample",):
+                raise ValueError("use 'sample <file>' to choose the wav file")
+            if rest.lower().startswith("sample"):
+                shell.do_sample(rest.split(None, 1)[1] if " " in rest else "")
+            elif rest:
+                shell.set_order(index, rest.split())
+            else:
+                shell.show_order(index)
             return
         if rest:
             shell._edit_verb(rest)
@@ -2105,7 +2949,10 @@ class SeqShell(SeqCompletingCmd):
         rest = text[len(token):].strip()
         try:
             path = parse_compact_path(token, None, None)
-        except ValueError:
+        except ValueError as e:
+            if _PATH_TOKEN_RE.fullmatch(token) or re.match(r"(?i)^t\d+", token):
+                print(f"Error: {e}")
+                return
             hint = old_command_hint(token)
             print(f"*** Unknown command: {line}")
             if hint:
@@ -2126,6 +2973,25 @@ class TrackShell(SeqCompletingCmd):
         self.track_number = track_number
         self.prompt = f"seq:t{track_number}> "
         initialize_readline()
+
+    def _abs_operand(self, operand):
+        """Resolve a relative operand against this track: 'p1' -> 't1p1'."""
+        if not operand or operand.startswith("/"):
+            return operand
+        if re.match(r"(?i)^t\d+", operand) or re.match(r"(?i)^lfo", operand):
+            return operand
+        if re.match(r"(?i)^p\d+", operand):
+            return f"t{self.track_number}{operand}"
+        return operand
+
+    def _cp_rm_paths(self, text):
+        """Make cp/rm operands absolute relative to this track menu."""
+        parts = text.split()
+        if len(parts) < 2:
+            return text
+        if parts[0].lower() == "rm":
+            return " ".join([parts[0], self._abs_operand(parts[1])] + parts[2:])
+        return " ".join([parts[0]] + [self._abs_operand(p) for p in parts[1:]])
 
     def _switch_track(self, n):
         self.track_number = n
@@ -2172,31 +3038,33 @@ class TrackShell(SeqCompletingCmd):
                              "mt<k> or scale/root/bpm/division/channel")
 
     def do_start(self, arg):
-        "Play a phrase of this track, or by full path: start p<m>f<k> / t<n>p<m>f<k>"
+        """Play a phrase or loop order: start p<m>f<k> / p<m>o<k> (paths work too)"""
         try:
             path = parse_compact_path(arg, track=self.track_number)
-            if path["kind"] != "f":
-                raise ValueError("use start p<m>f<k> (e.g. start p1f1)")
+            if path["kind"] not in ("f", "o"):
+                raise ValueError("use start p<m>f<k> (phrase, e.g. start p1f1) "
+                                 "or p<m>o<k> (loop order, e.g. start p1o0)")
         except ValueError as e:
             print(f"Error: {e}")
             return
-        self._root_shell().launch_phrase(path["track"], path["pattern"],
-                                         path["index"])
+        self._root_shell().launch(path["track"], path["pattern"],
+                                  path["kind"], path["index"])
 
     def do_stop(self, arg):
-        "Stop a phrase of this track, or by full path: stop p<m>f<k> / t<n>p<m>f<k>"
+        """Stop a phrase or loop order of this track (paths work too)"""
         try:
             path = parse_compact_path(arg, track=self.track_number)
-            if path["kind"] != "f":
-                raise ValueError("use stop p<m>f<k> (e.g. stop p1f1)")
+            if path["kind"] not in ("f", "o"):
+                raise ValueError("use stop p<m>f<k> (phrase) or p<m>o<k> "
+                                 "(loop order)")
         except ValueError as e:
             print(f"Error: {e}")
             return
-        self._root_shell().stop_phrase(path["track"], path["pattern"],
-                                       path["index"])
+        self._root_shell().stop_target(path["track"], path["pattern"],
+                                       path["kind"], path["index"])
 
     def do_panic(self, arg):
-        "Stop all phrases and silence all MIDI outputs"
+        "Stop everything (phrases, loops) and silence MIDI/audio outputs"
         self._root_shell().panic()
 
     def do_help(self, arg):
@@ -2205,7 +3073,7 @@ class TrackShell(SeqCompletingCmd):
         print(f"\nTrack {self.track_number} Commands:")
         print(f"  {'p<m>':<18} - enter the menu of a pattern (m = 1-16)")
         print(f"  {'p<m>s<k> [deg...]':<18} - set a sequence of that pattern (s0..s9)")
-        print(f"  {'p<m>f<k> <expr>':<18} - define a phrase of that pattern (f1..f16)")
+        print(f"  {'p<m>f<k> <expr>':<18} - define a phrase of that pattern (f0..f7)")
         print(f"  {'p<m> scale|root|bpm|channel':<18} - edit that pattern setting")
         print(f"  {'p<m> division 1/16':<18} - step note value (1, 1/2, 1/3, 1/16 ...)")
         print(f"  {'p<m> type note|CC':<18} - pattern kind (default note)")
@@ -2214,11 +3082,11 @@ class TrackShell(SeqCompletingCmd):
         print(f"  {'start p<m>f<k>':<18} - play a phrase of this track")
         print(f"  {'stop p<m>f<k>':<18} - stop a phrase of this track")
         print(f"  {'t<n>':<18} - switch to another track menu")
-        print(f"  {'cp <src> <dst>':<18} - copy a track, pattern, sequence or phrase")
-        print(f"  {'rm <path> [setting]':<18} - delete/zeroize a track, pattern, sequence, phrase or setting")
+        print(f"  {'cp <src> <dst>':<18} - copy a track/pattern/leaf, relative: cp p1 p2")
+        print(f"  {'rm <path> [setting]':<18} - delete a leaf/setting, relative: rm p1, rm p3s0")
         print(f"  {'panic':<18} - stop all phrases and silence all MIDI outputs")
         print(f"  {'/':<18} - return to the main menu from anywhere")
-        print(f"  {'/ <command>':<18} - run a main-menu command and return to the top menu")
+        print(f"  {'/ <command>':<18} - run a main-menu command, staying in this menu")
         print(f"  {'help':<18} - show this help")
         print(f"  {'exit':<18} - return to the main menu (playback keeps running)")
         print(f"\n  Current track: {self.track_number}")
@@ -2245,16 +3113,15 @@ class TrackShell(SeqCompletingCmd):
             if not command:
                 self.request_root()
                 return True
-            # '/ <root command>' runs at the root and returns to the top menu.
+            # '/ <root command>' runs at the root; the menu stays put.
             self.run_root_command(command)
-            self.request_root()
-            return True
+            return
         token, rest = parts[0], text[len(parts[0]):].strip()
         if token.lower().startswith("lfo"):  # jump to an LFO menu from here
             self._root_shell().onecmd(text)
             return True if self.propagate_root_request() else None
         if token.lower() in ("cp", "rm"):  # copy / remove by path
-            self._root_shell().onecmd(text)
+            self._root_shell().onecmd(self._cp_rm_paths(text))
             return
         # 'show ...' is handled by the root; make it relative to this track.
         if token.lower() == "show":
@@ -2267,7 +3134,10 @@ class TrackShell(SeqCompletingCmd):
             return
         try:
             path = parse_compact_path(token, track=self.track_number)
-        except ValueError:
+        except ValueError as e:
+            if _PATH_TOKEN_RE.fullmatch(token):
+                print(f"Error: {e}")
+                return
             hint = old_command_hint(token)
             print(f"*** Unknown command: {line}")
             if hint:
@@ -2317,6 +3187,11 @@ class LfoShell(SeqCompletingCmd):
         lfos = root.project.setdefault("lfos", {})
         return lfos.setdefault(self.lfo_number, {})
 
+    def precmd(self, line):
+        """Re-read this LFO before each command (its values may have changed)."""
+        self._load_from_store()
+        return line
+
     def _load_from_store(self):
         entry = self.parent_shell.project.get("lfos", {}).get(self.lfo_number, {})
         self.frequency = entry.get("frequency", LFO_DEFAULTS["frequency"])
@@ -2362,10 +3237,18 @@ class LfoShell(SeqCompletingCmd):
     # ------------------------------------------------------------------
     # Live visualization of the instantaneous normalized LFO value
     # ------------------------------------------------------------------
-    def _meter(self, v):
-        """Single-line level meter around a fixed center point."""
+    def _meter(self, v, unipolar=False):
+        """Single-line level meter: centered, or left-anchored for ramp."""
         half = 12
         cells = ["\u00b7"] * (2 * half + 1)  # midpoint dots
+        if unipolar:  # ramp: 0..1, drawn like a progress bar
+            vv = max(0.0, min(1.0, v))
+            level = int(vv * (2 * half) + 0.5)
+            for i in range(level):
+                cells[i] = "#"
+            if level < len(cells):
+                cells[level] = "|"
+            return "[" + "".join(cells) + "]"
         cells[half] = "|"
         vv = max(-1.0, min(1.0, v))
         level = int(abs(vv) * half + 0.5)
@@ -2406,7 +3289,7 @@ class LfoShell(SeqCompletingCmd):
             return False
         self._live_last = now
         v = self._live_value(self._live_t0)
-        prefix = f"{self._meter(v)} {v:+.2f}  "
+        prefix = f"{self._meter(v, self.shape == 'ramp')} {v:+.2f}  "
         if prefix == self._live_prefix:
             return False
         self._live_prefix = prefix
@@ -2418,7 +3301,9 @@ class LfoShell(SeqCompletingCmd):
         try:
             while not self._live_stop.is_set():
                 v = self._live_value(start)
-                frame = (f"\r\x1b[2K{self._meter(v)} {v:+.2f}  {self.prompt}")
+                frame = (f"\r\x1b[2K"
+                         f"{self._meter(v, self.shape == 'ramp')} "
+                         f"{v:+.2f}  {self.prompt}")
                 sys.stdout.write(frame)
                 sys.stdout.flush()
                 time.sleep(1 / LFO_LIVE_FPS)
@@ -2630,7 +3515,7 @@ class LfoShell(SeqCompletingCmd):
         print()
 
     def do_panic(self, arg):
-        "Stop all phrases and silence all MIDI outputs"
+        "Stop everything (phrases, loops) and silence MIDI/audio outputs"
         self.parent_shell.panic()
 
     def do_help(self, arg):
@@ -2638,7 +3523,7 @@ class LfoShell(SeqCompletingCmd):
             return super().do_help(arg.strip().replace("-", "_"))
         print(f"\nLFO {self.lfo_number} Commands:")
         print(f"  {'frequency [<hz>|expr]':<22} - Hz or a tempo multiple, e.g. 0.5, 2bpm, freq 2bpm")
-        print(f"  {'shape [<name>]':<20} - show or set the shape: sin, tri, saw, square")
+        print(f"  {'shape [<name>]':<20} - sin, tri, saw, square, ramp (0..1), random")
         print(f"  {'phase [<-1..1>]':<20} - start point of the waveform (-1 to 1)")
         print(f"  {'show':<20} - show all parameters of this LFO")
         print(f"  {'rm [lfo<n>] [param]':<20} - reset this LFO (or another, or one parameter)")
@@ -2646,11 +3531,11 @@ class LfoShell(SeqCompletingCmd):
         print(f"  {'stop':<20} - stop this LFO")
         print(f"  {'live':<20} - show the live instantaneous value next to the prompt")
         print(f"  {'live stop':<20} - stop the live view")
-        print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, sequence or phrase")
+        print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, leaf or LFO (cp lfo1 lfo2)")
         print(f"  {'rm <path>|lfo<n>':<20} - delete a track/pattern/sequence/phrase, reset an LFO or a setting")
-        print(f"  {'panic':<20} - stop all phrases and silence all MIDI outputs")
+        print(f"  {'panic':<20} - stop all playback (phrases, loops) and silence outputs")
         print(f"  {'/':<20} - return to the main menu from anywhere")
-        print(f"  {'/ <command>':<20} - run a main-menu command and return to the top menu")
+        print(f"  {'/ <command>':<20} - run a main-menu command, staying in this menu")
         print(f"  {'help':<20} - show this help")
         print(f"  {'exit':<20} - return to the main menu")
         print(f"\n  LFO {self.lfo_number}: {self._running_text()}, frequency "
@@ -2680,8 +3565,7 @@ class LfoShell(SeqCompletingCmd):
                 self.request_root()
                 return True
             self.parent_shell.run_root_command(command)
-            self.request_root()
-            return True
+            return
         if parts:
             token = parts[0]
             rest = text[len(token):].strip()
@@ -2712,6 +3596,16 @@ class PatternShell(SeqCompletingCmd):
         self.pattern_number = pattern_number
         self.prompt = f"seq:t{parent.track_number}p{pattern_number}> "
         self._player = None  # active phrase playback (player.Player) if any
+        # Live histogram view state (kept across reloads, see precmd).
+        self._live_block = []       # panel lines drawn below the prompt
+        self._hist_phrase = None    # phrase (or sequence) index being shown
+        self._hist_expr = None      # explicit expression override
+        self._hist_label = None
+        self._hist_cached = None
+        self._hist_last = 0.0
+        self._hist_spin = 0
+        self._hist_spin_last = 0.0
+        self._live_active = False
         self._load_from_store()
         initialize_readline()
 
@@ -2734,14 +3628,10 @@ class PatternShell(SeqCompletingCmd):
         self.velocities = {}  # seq index (0-9) -> velocity expression text
         self.sustains = {}  # seq index (0-9) -> sustain expression text
         self.microtimes = {}  # seq index (0-9) -> microtiming expression text
-        self.pattern_type = "note"  # "note" (default) or "cc"
+        self.sample = None   # loop pattern: .wav file name inside samples/
+        self.orders = {}     # loop pattern: o index (0-9) -> [position|expr|None]
+        self.pattern_type = "note"  # "note", "cc" or "loop"
         self.controller = 1  # CC number used by cc patterns
-        self._live_block = []   # histogram lines drawn above the prompt
-        self._hist_phrase = None
-        self._hist_cached = None
-        self._hist_last = 0.0
-        self._hist_spin = 0
-        self._hist_spin_last = 0.0
         self.division = DEFAULT_DIVISIONS  # step = 1/division note
         self.channel = DEFAULT_CHANNEL
         # BPM defaults to the global value; 'bpm' in this menu overrides it locally.
@@ -2749,6 +3639,11 @@ class PatternShell(SeqCompletingCmd):
         self.bpm_inherited = True
         # MIDI output port: None means inherit the global selection.
         self.out_port = None
+
+    def precmd(self, line):
+        """Re-read the pattern before each command (cp/rm/load may have run)."""
+        self._load_from_store()
+        return line
 
     def _load_from_store(self):
         """Load this pattern's stored values, or defaults if never configured."""
@@ -2775,6 +3670,8 @@ class PatternShell(SeqCompletingCmd):
         self.pattern_type = str(entry.get("type", "note")).lower()
         self.controller = int(entry.get("controller", 1))
         self.division = entry.get("division", DEFAULT_DIVISIONS)
+        self.sample = entry.get("sample")
+        self.orders = dict(entry.get("orders", {}))
 
     def _commit(self):
         """Write the current pattern values back into the project store."""
@@ -2795,11 +3692,15 @@ class PatternShell(SeqCompletingCmd):
             "type": self.pattern_type,
             "controller": self.controller,
             "division": self.division,
+            "sample": self.sample,
+            "orders": dict(self.orders),
         })
 
     def _switch_pattern(self, n):
         # Navigating between patterns does not stop playback: any phrase that
         # was started keeps playing in the background.
+        if getattr(self, "_live_active", False):
+            self._stop_hist_live(announce=False)  # panel belongs to this pattern
         self.pattern_number = n
         self.prompt = f"seq:t{self._track_number()}p{n}> "
         self._load_from_store()
@@ -2829,28 +3730,95 @@ class PatternShell(SeqCompletingCmd):
         expr_text = (expr_text or "").strip()
         if not expr_text:
             if index in self.phrases:
-                print(f"phrase-{index}: {self.phrases[index]}")
+                print(f"f{index}: {self.phrases[index]}")
             else:
-                print(f"phrase-{index}: not configured. "
+                print(f"f{index}: not configured. "
                       f"Usage: f{index} <expression>  e.g. f{index} 4*(s0+2*s1)")
             return False
         try:
             canonical = phrases.parse_phrase_expr(expr_text)
+            refs = phrases.unit_refs(canonical)
         except phrases.PhraseError as e:
             print(f"Error: {e}")
             return False
+        if self.pattern_type == "loop":
+            bad = [f"s{i}" for kind, i in refs if kind == "seq"]
+            if bad:
+                print(f"Error: a loop pattern arrangement uses order lists, "
+                      f"not sequences ({', '.join(bad)}). "
+                      f"Write e.g. f{index} inf*o0")
+                return False
+        else:
+            bad = [f"o{i}" for kind, i in refs if kind == "order"]
+            if bad:
+                print(f"Error: a '{self.pattern_type}' pattern uses sequences, "
+                      f"not order lists ({', '.join(bad)}). "
+                      f"Write e.g. f{index} inf*s0")
+                return False
         self.phrases[index] = canonical
         self._commit()
-        print(f"Phrase {index} set: {canonical}{self._live_hint()}")
+        print(f"f{index} set: {canonical}{self._live_hint()}")
         return True
 
-    def _hist_target(self, arg):
-        """Pick what to render: (phrase_index, expr, label).
+    def _abs_operand(self, operand):
+        """Resolve a relative operand: 's0' -> 't1p1s0', 'p2' -> 't1p2'."""
+        if not operand or operand.startswith("/"):
+            return operand
+        if re.match(r"(?i)^t\d+", operand) or re.match(r"(?i)^lfo", operand):
+            return operand
+        base = f"t{self._track_number()}"
+        if re.match(r"(?i)^p\d+", operand):
+            return base + operand
+        if re.match(r"(?i)^(?:s|f|v|sus|mt)\d+", operand):
+            return f"{base}p{self.pattern_number}{operand}"
+        return operand
 
-        Explicit 'f<k>' or 's<k>'; otherwise the phrase currently playing for
-        this pattern, else the lowest configured phrase.
+    def _cp_rm_paths(self, text):
+        """Make cp/rm operands absolute relative to this pattern menu."""
+        parts = text.split()
+        if len(parts) < 2:
+            return text
+        if parts[0].lower() == "rm":
+            settings = ("scale", "root", "bpm", "channel", "division", "type",
+                        "controller", "port", "select-port")
+            if parts[1].lower() in settings:
+                # 'rm division' means this pattern's division, keep the word
+                return " ".join([parts[0], f"t{self._track_number()}"
+                                 f"p{self.pattern_number}"] + parts[1:])
+            return " ".join([parts[0], self._abs_operand(parts[1])] + parts[2:])
+        return " ".join([parts[0]] + [self._abs_operand(p) for p in parts[1:]])
+
+    def _hist_target(self, arg):
+        """Pick what to render: (index, expr, label).
+
+        Explicit 'f<k>' (phrase) or 's<k>'/'o<k>' (one sequence / order list);
+        otherwise whatever is playing for this pattern, else the lowest
+        configured phrase, else the lowest configured sequence / order list.
         """
         text = (arg or "").strip()
+        if self.pattern_type == "loop":
+            m = re.fullmatch(r"(?i)o(\d+)", text)
+            if m:
+                n = int(m.group(1))
+                if n not in self.orders:
+                    return None, None, f"o{n} is not configured in this pattern."
+                return n, f"inf*o{n}", f"o{n}"
+            m = re.fullmatch(r"(?i)f(\d+)", text)
+            if m:
+                return int(m.group(1)), None, None
+            playing = [key[2] for key, pl in
+                       self._root_shell().playback.items()
+                       if key[0] == self._track_number()
+                       and key[1] == self.pattern_number and pl.running
+                       and len(key) == 3]
+            if playing:
+                return playing[0], None, None
+            if self.phrases:
+                return min(self.phrases), None, None
+            if self.orders:
+                n = min(self.orders)
+                return n, f"inf*o{n}", f"o{n} (no phrase configured)"
+            return None, None, None
         m = re.fullmatch(r"(?i)f(\d+)", text)
         if m:
             return int(m.group(1)), None, None
@@ -2889,13 +3857,199 @@ class PatternShell(SeqCompletingCmd):
     def _hist_lines(self, phrase_index, live=False, expr=None, label=None,
                     spin=0):
         root = self._root_shell()
-        return histogram_lines(self._hist_view(), root.project.get("lfos", {}),
+        lfos = root.project.get("lfos", {})
+        view = self._hist_view()
+        if self.pattern_type == "loop":
+            if expr is None:
+                expr = self.phrases.get(phrase_index)
+            if expr is None:
+                if phrase_index is None:
+                    return []
+                return [f"f{phrase_index} is not configured in this pattern "
+                        f"(hist f<k>|o<k> to pick another)."]
+            if label is None and phrase_index is not None:
+                label = f"f{phrase_index} ({expr})"
+            return loop_histogram_lines(view, lfos, self.bpm,
+                                        time.monotonic(), expr=expr,
+                                        label=label, live=live,
+                                        playhead=self._hist_playhead(),
+                                        spin=spin)
+        return histogram_lines(view, lfos,
                                self.bpm, time.monotonic(), phrase_index,
                                live=live, expr=expr, label=label,
                                playhead=self._hist_playhead(), spin=spin)
 
+    def _sample_seconds(self):
+        """Length of the selected sample in seconds, or None."""
+        path, err = sampler.resolve_sample(self.sample)
+        if err:
+            return None
+        return sampler.sample_seconds(path)
+
+    def _bars_text(self, steps):
+        """How a step count sits in 4/4 bars at this division ('' if unknown)."""
+        return bars_text(steps, self.division)
+
+    def _sample_line(self):
+        """Human-readable summary of the selected sample."""
+        if not self.sample:
+            found = sampler.list_samples()
+            extra = (f"  Available: {', '.join(found)}" if found
+                     else "  (the samples folder is empty)")
+            return f"no sample selected  [{sampler.samples_dir()}]{extra}"
+        path, err = sampler.resolve_sample(self.sample)
+        if err:
+            return f"{self.sample} (missing: {err})"
+        seconds = sampler.sample_seconds(path)
+        return f"{self.sample}  ({seconds:.2f} s, {sampler.samples_dir()})"
+
+    def do_sample(self, arg):
+        "Show or set the .wav file of a loop pattern (looked up in samples/)"
+        text = (arg or "").strip()
+        if not text:
+            print(f"Sample: {self._sample_line()}")
+            if self.pattern_type != "loop":
+                print(f"  (this pattern is type '{self.pattern_type}'; "
+                      f"'type loop' makes it play the sample)")
+            if self.sample:
+                print(f"  Positions are normalised to the sample length: "
+                      f"'o0 0.2 0.3 0.6' starts from 20 %, 30 % and 60 % "
+                      f"(negatives wrap: -0.2 = 0.8).")
+            return
+        path, err = sampler.resolve_sample(text)
+        if err:
+            print(f"Error: {err}")
+            return
+        try:
+            sample = sampler.load_sample(path)   # validate it can be played
+        except (ValueError, OSError) as e:
+            print(f"Error: {e}")
+            return
+        self.sample = os.path.basename(path)
+        self._commit()
+        print(f"Sample set to {self.sample} ({sampler.samples_dir()})")
+        print(f"  Length {sample.duration_text()}.")
+        if self.pattern_type != "loop":
+            print(f"  Note: this pattern is type '{self.pattern_type}'; use "
+                  f"'type loop' to play it.")
+
+    def set_order(self, index, tokens):
+        """Set order list o<index>: positions in the sample, or 'r' (rest).
+
+        The sample length is 1, so '0.2' means "start at 20 %". An entry may be
+        an expression with LFOs ('lfo1', '0.3+0.1*lfo1'); it is evaluated at
+        every step and wrapped modulo 1, so negative values work too.
+        """
+        if not tokens:
+            self.show_order(index)
+            return False
+        order = []
+        for tok in tokens:
+            low = tok.lower()
+            if low == "r":
+                order.append(None)
+                continue
+            try:
+                constant, terms = parse_seq_expr(low)
+            except ValueError as e:
+                print(f"Error: invalid position '{tok}': {e}")
+                print(f"  Use a position 0..1 (e.g. 0.2, 0.75, -0.1), 'r' for "
+                      f"a rest, or an LFO expression like lfo1 or 0.5*lfo2.")
+                return False
+            if not terms:
+                order.append(float(constant) % 1.0)
+                continue
+            for _coef, ref in variation_terms(terms):
+                if not 1 <= ref <= MAX_LFOS:
+                    print(f"Error: LFO reference lfo{ref} must be between 1 "
+                          f"and {MAX_LFOS}.")
+                    return False
+            order.append(parse_seq_canonical(low))
+        self.orders[index] = order
+        self._commit()
+        step_ms = division_step_ms(self.bpm, self.division)
+        bars = self._bars_text(len(order))
+        bars_txt = f", {bars}" if bars else ""
+        print(f"o{index} set: {order_to_text(order)}   "
+              f"({len(order)} steps x {step_ms:g} ms = "
+              f"{len(order) * step_ms:g} ms per pass{bars_txt}; positions in "
+              f"the sample)")
+        now = self._order_now(order)
+        if order_has_lfo(order):
+            print(f"  LFO entries set the position at each step; now: {now}")
+            lfos = self._root_shell().project.get("lfos", {})
+            refs = sorted({ref for item in order if isinstance(item, str)
+                           for _c, ref in variation_terms(
+                               parse_seq_expr(item)[1])})
+            stopped = [r for r in refs
+                       if not (lfos.get(r) or {}).get("running")]
+            if stopped:
+                print(f"  Note: {', '.join(f'lfo{r}' for r in stopped)} "
+                      f"stopped -> contributes 0 (position 0 here).")
+        outside = [item for item in order
+                   if isinstance(item, float) and not 0.0 <= item <= 1.0]
+        if outside:
+            print(f"  Note: positions are wrapped modulo 1 "
+                  f"({', '.join(f'{v:g} -> {v % 1.0:g}' for v in outside)}).")
+        return True
+
+    def _order_now(self, order):
+        """Resolve an order list at this instant, for display."""
+        lfos = self._root_shell().project.get("lfos", {})
+        out = []
+        for item in order:
+            if item is None:
+                out.append("r")
+            else:
+                value = order_entry_value(item, lfos, self.bpm,
+                                          time.monotonic())
+                out.append("--" if value is None else f"{value:.2f}")
+        return " ".join(out)
+
+    def show_order(self, n):
+        """Print one stored order list."""
+        if n in self.orders:
+            order = self.orders[n]
+            step_ms = division_step_ms(self.bpm, self.division)
+            extra = ""
+            if order_has_lfo(order):
+                extra = f"   -> now {self._order_now(order)}"
+            print(f"o{n}: {order_to_text(order)}   "
+                  f"({len(order)} steps = {len(order) * step_ms:g} ms)"
+                  f"{extra}")
+        else:
+            print(f"o{n}: not configured. Usage: o{n} <position ...>  "
+                  f"e.g. o{n} 0 0.25 0.5 (the sample length is 1), or an LFO "
+                  f"entry like o{n} 0.2 lfo1 ('r' = rest)")
+
+    def do_list_o(self, arg):
+        "List the loop orders of this pattern (o0..o9) and the sample"
+        step_ms = division_step_ms(self.bpm, self.division)
+        print(f"\nLoop (pattern {self.pattern_number}, "
+              f"step {step_ms:g} ms at division "
+              f"{division_to_text(self.division)}, bpm {self.bpm}):")
+        print(f"  sample: {self._sample_line()}")
+        if not self.orders:
+            print("  (no order list configured - use e.g. 'o0 0 0.25 0.5')")
+            print()
+            return
+        for k in sorted(self.orders):
+            order = self.orders[k]
+            bars = self._bars_text(len(order))
+            bars_txt = f", {bars}" if bars else ""
+            extra = ""
+            if order_has_lfo(order):
+                extra = f"   -> now {self._order_now(order)}"
+            print(f"  o{k}: {order_to_text(order):<20} -> {len(order)} steps = "
+                  f"{len(order) * step_ms:g} ms per pass{bars_txt}{extra}")
+        print()
+
     def do_hist(self, arg):
-        "Show a per-step histogram of a phrase: hist [f<k>|s<k>] [live|once|stop]"
+        """Per-step histogram: note/CC values, or sample positions for a loop
+
+        Usage: hist [f<k>|s<k>|o<k>] [live|once|stop]
+        """
+        is_loop = self.pattern_type == "loop"
         text = (arg or "").strip().lower()
         if text.startswith("live "):
             text = text[5:].strip()  # accept 'live stop' / 'live off'
@@ -2919,8 +4073,11 @@ class PatternShell(SeqCompletingCmd):
                 print("Nothing to show: no phrase or sequence is configured "
                       "in this pattern.")
             return
-        if text and not re.fullmatch(r"(?i)[fs]\d+", text):
-            print("Usage: hist [f<k>|s<k>] [live|stop]   e.g. hist, hist f1 live")
+        usage = (r"(?i)[fs]\d+" if not is_loop else r"(?i)[fo]\d+")
+        if text and not re.fullmatch(usage, text):
+            example = "hist o0" if is_loop else "hist f1"
+            print(f"Usage: hist [f<k>|{'o' if is_loop else 's'}<k>] "
+                  f"[live|stop]   e.g. hist, {example} live")
             return
         lines = self._hist_lines(phrase, live=live, expr=expr, label=label)
         if live:
@@ -2929,7 +4086,7 @@ class PatternShell(SeqCompletingCmd):
                 print("\n".join(lines))
                 return
             _enable_ansi()
-            self._hist_phrase = phrase
+            self._hist_phrase = phrase if phrase is not None else 0
             self._hist_expr = expr
             self._hist_label = label
             self._hist_cached = None
@@ -2948,6 +4105,8 @@ class PatternShell(SeqCompletingCmd):
         """
         if not getattr(self, "_live_active", False):
             return False
+        if getattr(self, "_hist_phrase", None) is None:
+            return False  # nothing to show (e.g. the phrase was removed)
         now = time.monotonic()
         if now - getattr(self, "_hist_last", 0.0) < 1 / 10.0:
             return False
@@ -2985,24 +4144,43 @@ class PatternShell(SeqCompletingCmd):
             print("Histogram live view stopped.")
 
     def do_type(self, arg):
-        "Show or set the pattern type: note (default) or CC"
+        "Show or set the pattern type: note (default), CC or loop"
         text = (arg or "").strip().lower()
         if not text:
             extra = (f" (controller {self.controller})"
                      if self.pattern_type == "cc" else "")
-            print(f"Type: {'CC' if self.pattern_type == 'cc' else 'note'}{extra}")
+            if self.pattern_type == "loop":
+                sample = self.sample or "(no sample selected)"
+                length = self._sample_seconds()
+                secs = f", {length:.2f} s" if length is not None else ""
+                extra = f" (sample {sample}{secs})"
+            shown = {"cc": "CC", "loop": "loop"}.get(self.pattern_type, "note")
+            print(f"Type: {shown}{extra}")
             return
         if text in ("note", "notes"):
             self.pattern_type = "note"
         elif text in ("cc", "control", "controller-change"):
             self.pattern_type = "cc"
+        elif text in ("loop", "sample", "sampler"):
+            self.pattern_type = "loop"
         else:
-            print(f"Error: unknown type '{arg.strip()}'. Use 'note' or 'CC'.")
+            print(f"Error: unknown type '{arg.strip()}'. Use 'note', 'CC' or "
+                  f"'loop'.")
             return
         self._commit()
         if self.pattern_type == "cc":
             print(f"Type set to CC (controller {self.controller}); "
                   f"sequences hold raw values 0..127")
+        elif self.pattern_type == "loop":
+            if self.sample:
+                length = self._sample_seconds()
+                secs = f", {length:.2f} s" if length is not None else ""
+                print(f"Type set to loop (sample {self.sample}{secs}); order "
+                      f"positions with 'o0 <0..1 ...>' and play with "
+                      f"'start o0' (or arrange them in a phrase)")
+            else:
+                print("Type set to loop; choose a file with 'sample <name.wav>' "
+                      f"from {sampler.samples_dir()}")
         else:
             print("Type set to note")
 
@@ -3044,6 +4222,17 @@ class PatternShell(SeqCompletingCmd):
               f"(step {division_step_ms(self.bpm, n):g} ms at {self.bpm} BPM)"
               f"{self._live_hint()}")
 
+    def launch_loop(self, track, pattern, index):
+        """Start a loop order list through the root (owns the player)."""
+        self._root_shell().launch_loop(track, pattern, order_index=index)
+
+    def launch_loop_phrase(self, track, pattern, phrase):
+        """Start a loop arrangement (phrase of order lists)."""
+        self._root_shell().launch_loop(track, pattern, phrase=phrase)
+
+    def stop_loop(self, track, pattern, index, phrase=None):
+        self._root_shell().stop_loop(track, pattern, index, phrase=phrase)
+
     def _edit_verb(self, rest):
         """Dispatch scale/root/bpm/channel edits (used by path commands)."""
         parts = (rest or "").split(maxsplit=1)
@@ -3067,41 +4256,71 @@ class PatternShell(SeqCompletingCmd):
             self.do_type(arg)
         elif verb == "controller":
             self.do_controller(arg)
+        elif verb in ("sample", "samples"):
+            self.do_sample(arg)
         elif verb in ("hist", "histogram"):
             self.do_hist(arg)
+        elif verb in ("list-s", "list-sequences"):
+            self.do_list_s(arg)
+        elif verb in ("list-f", "list-phrases"):
+            self.do_list_f(arg)
+        elif verb == "list-v":
+            self.do_list_v(arg)
+        elif verb == "list-sus":
+            self.do_list_sus(arg)
+        elif verb == "list-mt":
+            self.do_list_mt(arg)
+        elif verb in ("list-o", "list-orders"):
+            self.do_list_o(arg)
         else:
             raise ValueError(f"unknown pattern setting '{verb}' (use scale, "
                              f"root, bpm, channel, division, type, controller, "
-                             f"hist, select-port, s<k> or f<k>)")
+                             f"sample, hist, list-o, select-port, "
+                             f"s<k>, f<k> or o<k>)")
 
     def do_start(self, arg):
-        "Play a phrase: start f<k>, or by path t<n>p<m>f<k> from anywhere"
+        """Play a phrase (f<k>) or a loop order (o<k>): start f0 / start o0"""
+        text = (arg or "").strip()
+        if not text and self.pattern_type == "loop":
+            # convenience: the first phrase, else the first order list
+            if self.phrases:
+                text = f"f{min(self.phrases)}"
+            elif self.orders:
+                text = f"o{min(self.orders)}"
         try:
-            path = parse_compact_path(arg, track=self._track_number(),
+            path = parse_compact_path(text, track=self._track_number(),
                                       pattern=self.pattern_number)
-            if path["kind"] != "f":
-                raise ValueError("use start f<k> (e.g. start f1)")
+            if path["kind"] not in ("f", "o"):
+                raise ValueError("use start f<k> (phrase, e.g. start f0) or "
+                                 "start o<k> (loop shortcut, e.g. start o0)")
         except ValueError as e:
             print(f"Error: {e}")
             return
         root = self._root_shell()
-        self._player = root.launch_phrase(path["track"], path["pattern"],
-                                          path["index"])
+        if path["kind"] == "o" or self.pattern_type == "loop":
+            root.launch(path["track"], path["pattern"], path["kind"],
+                        path["index"])
+            self._player = None
+        else:
+            self._player = root.launch_phrase(path["track"], path["pattern"],
+                                              path["index"])
 
     def do_stop(self, arg):
-        "Stop a phrase: stop [f<k>] or by path t<n>p<m>f<k>; no arg stops this pattern"
+        """Stop a phrase (f<k>) or loop order (o<k>); no arg stops this pattern"""
         text = (arg or "").strip()
         root = self._root_shell()
         if text:
             try:
                 path = parse_compact_path(text, track=self._track_number(),
                                           pattern=self.pattern_number)
-                if path["kind"] != "f":
-                    raise ValueError("use stop f<k>")
+                if path["kind"] not in ("f", "o"):
+                    raise ValueError("use stop f<k> (phrase) or stop o<k> "
+                                     "(loop order)")
             except ValueError as e:
                 print(f"Error: {e}")
                 return
-            root.stop_phrase(path["track"], path["pattern"], path["index"])
+            root.stop_target(path["track"], path["pattern"], path["kind"],
+                             path["index"])
         else:
             root.stop_pattern(self._track_number(), self.pattern_number)
         self._player = None
@@ -3203,7 +4422,8 @@ class PatternShell(SeqCompletingCmd):
         """Resolve a stored sequence (note names, or CC values in cc mode)."""
         lfos = self._root_shell().project.get("lfos", {})
         if self.pattern_type == "cc":
-            return describe_cc_values(seq, lfos, self.bpm, time.monotonic())
+            return describe_cc_values(seq, lfos, self.bpm, time.monotonic(),
+                                      notes=True)
         return resolve_seq_notes(seq, self.root, self.scale,
                                  lfos, self.bpm, time.monotonic())
 
@@ -3216,37 +4436,45 @@ class PatternShell(SeqCompletingCmd):
                       f"{self.controller}; 'r' skips a step.")
             else:
                 print(f"Usage: s{n} <degree|r> [...]  e.g. s{n} 0 0 r 3")
-                print(f"  Degrees index the {self.scale} scale (0 = root); "
-                      f"'r' is a rest.")
+                print(f"  Degrees index the pattern's scale (0 = root, "
+                      f"currently {self.scale}) and wrap across octaves, so "
+                      f"they follow any later scale change; 'r' is a rest.")
                 print("  Prefix O = next octave up, o = next octave down (e.g. O0, o3).")
-            print("  LFO variation: <degree>*<amp>*lfo<N>[*lfo<M>...] e.g. "
-                  "0*5*lfo1 or 0*5*lfo1*lfo2")
-            print("     moves round(amp x lfo1 x lfo2 x ...) scale steps "
-                  "(octaves wrap; CC values clamp to 0..127).")
+            print("  LFO terms use regular algebra (products first, then "
+                  "sums): 127*lfo1 multiplies, 63+63*lfo1 offsets,")
+            print("     5*lfo1*lfo2 multiplies by two LFOs, 30-2*lfo1 subtracts. "
+                  "Bipolar LFOs go -1..1, ramp 0..1: pick 64+63*lfo1")
+            print("     for a centred sweep (33..127 becomes 1..127), 0*127*lfo1 "
+                  "with a ramp for 0..127. Note degrees wrap octaves;")
+            print("     CC values clamp to 0..127.")
             return False
         parsed = []
-        max_degree = 127 if cc else len(scales.SCALES[self.scale]) - 1
+        max_degree = 127  # degrees are scale-relative and wrap octaves
+        zero_lfo = []
         for tok in tokens:
             try:
                 entry = seq_token_entry(tok)
             except ValueError:
                 what = ("a value 0..127" if cc else
                         "a scale degree like 0, an octave prefixed one like O0 / o3")
-                print(f"Error: invalid token '{tok}'. Use {what}, 'r' for a rest, "
-                      f"or an LFO variation like 0*5*lfo1*lfo2.")
+                print(f"Error: invalid token '{tok}'. Use {what}, 'r' for a "
+                      f"rest, or an LFO term like 5*lfo1, 2*lfo1*lfo2 or "
+                      f"63+63*lfo1.")
                 return False
             if entry is None:
                 parsed.append(None)  # rest
                 continue
+            if entry[2] is None and re.search(r"(?i)lfo", tok):
+                zero_lfo.append(tok)   # e.g. 0*5*lfo1 multiplies out to 0
             degree, shift, variation = entry
             if degree > max_degree:
                 if cc:
                     print(f"Error: value {degree} is out of range for a CC "
                           f"pattern (values 0-127).")
                 else:
-                    print(f"Error: degree {degree} is out of range for the "
-                          f"{self.scale} scale (degrees 0-{max_degree}). "
-                          f"Use O/o to move octaves.")
+                    print(f"Error: degree {degree} is out of range "
+                          f"(degrees 0-127; they index the scale and wrap "
+                          f"across octaves).")
                 return False
             if variation is not None:
                 for _coef, ref in variation_terms(variation):
@@ -3258,6 +4486,9 @@ class PatternShell(SeqCompletingCmd):
         self.seqs[n] = parsed
         self._commit()
         print(f"s{n} set: {self._seq_tokens(parsed)}   -> {self._seq_notes(parsed)}")
+        for bad in zero_lfo:
+            print(f"  Note: '{bad}' multiplies out to 0 (products come first). "
+                  f"For an offset write it with a sum, e.g. 5*lfo1 or 0+5*lfo1.")
         return True
 
     def show_sequence(self, n):
@@ -3311,15 +4542,21 @@ class PatternShell(SeqCompletingCmd):
             canonical = velocity.canonical(text)
         except ValueError as e:
             print(f"Error: {e}")
-            print(f"       Usage: sus{index} <value|expr>   e.g. sus{index} 0.5 "
-                  f"or sus{index} 0.5+0.5*lfo1  (clamped to 0..1 when playing)")
+            print(f"       Usage: sus{index} <length|expr>  length in steps: "
+                  f"0.5 (half a step), 2 (two steps), 1/4 (a quarter step), "
+                  f"or an expression like 0.5+0.5*lfo1")
             return False
         self.sustains[index] = canonical
         self._commit()
-        now = velocity.evaluate_fraction(canonical,
-                                         self._root_shell().project.get("lfos", {}),
-                                         self.bpm, time.monotonic())
-        print(f"sus{index} set: {canonical}   (now {now:g} of the step)")
+        now = velocity.evaluate_span(canonical,
+                                     self._root_shell().project.get("lfos", {}),
+                                     self.bpm, time.monotonic(),
+                                     0.0, player.SUSTAIN_MAX_STEPS)
+        step_ms = division_step_ms(self.bpm, self.division)
+        print(f"sus{index} set: {canonical}   "
+              f"(now {now:g} step{'s' if now != 1 else ''} = "
+              f"{now * step_ms:g} ms at {division_to_text(self.division)}, "
+              f"{self.bpm} BPM)")
         return True
 
     def show_sustain(self, n):
@@ -3327,11 +4564,12 @@ class PatternShell(SeqCompletingCmd):
         if n in self.sustains:
             print(f"sus{n}: {self.sustains[n]}")
         else:
-            print(f"sus{n}: not configured. Usage: sus{n} <value|expr>  "
-                  f"e.g. sus{n} 0.5 (default is {player.SUSTAIN_FRACTION:g})")
+            print(f"sus{n}: not configured. Usage: sus{n} <length|expr>  "
+                  f"e.g. sus{n} 0.5 (half a step) or sus{n} 1/4; "
+                  f"default is {player.SUSTAIN_FRACTION:g} of the step")
 
     def set_microtime(self, index, text, via_path=False):
-        """Set microtiming mt<index>: signed share of the step (-0.5..0.5)."""
+        """Set microtiming mt<index>: signed offset in steps (early/late)."""
         text = (text or "").strip()
         if text.startswith("="):
             text = text[1:].strip()
@@ -3342,17 +4580,23 @@ class PatternShell(SeqCompletingCmd):
             canonical = velocity.canonical(text)
         except ValueError as e:
             print(f"Error: {e}")
-            print(f"       Usage: mt{index} <value|expr>   e.g. mt{index} -0.05 "
-                  f"or mt{index} 0.01*lfo1  (clamped to -0.5..0.5 of the step)")
+            print(f"       Usage: mt{index} <offset|expr>  offset in steps: "
+                  f"1/4 (a quarter step late), -1/8 (an eighth early), 0.5, "
+                  f"or an expression like 0.01*lfo1 "
+                  f"(clamped to +/-{player.MICROTIME_MAX_STEPS} steps)")
             return False
         self.microtimes[index] = canonical
         self._commit()
         now = velocity.evaluate_span(canonical,
                                      self._root_shell().project.get("lfos", {}),
-                                     self.bpm, time.monotonic(), -0.5, 0.5)
+                                     self.bpm, time.monotonic(),
+                                     -player.MICROTIME_MAX_STEPS,
+                                     player.MICROTIME_MAX_STEPS)
         step = division_step_ms(self.bpm, self.division)
-        print(f"mt{index} set: {canonical}   (now {now:+.4g} of the step = "
-              f"{now * step:+.1f} ms)")
+        print(f"mt{index} set: {canonical}   (now {now:+.4g} steps = "
+              f"{now * step:+.1f} ms "
+              f"{'late' if now > 0 else ('early' if now < 0 else 'on the grid')} "
+              f"at {division_to_text(self.division)}, {self.bpm} BPM)")
         return True
 
     def show_microtime(self, n):
@@ -3365,8 +4609,10 @@ class PatternShell(SeqCompletingCmd):
 
     def do_list_mt(self, arg):
         "List all configured microtiming sequences of this pattern (mt0..mt9)"
-        print(f"\nMicrotiming (pattern {self.pattern_number}, division "
-              f"{division_to_text(self.division)}, bpm {self.bpm}):")
+        step_ms = division_step_ms(self.bpm, self.division)
+        print(f"\nMicrotiming (pattern {self.pattern_number}, "
+              f"{division_to_text(self.division)} = {step_ms:g} ms, "
+              f"bpm {self.bpm}):   negative = earlier")
         if not self.microtimes:
             print("  (none configured - notes land exactly on the grid)")
             print()
@@ -3376,20 +4622,33 @@ class PatternShell(SeqCompletingCmd):
             expr = self.microtimes[n]
             now = velocity.evaluate_span(expr,
                                          self._root_shell().project.get("lfos", {}),
-                                         self.bpm, time.monotonic(), -0.5, 0.5)
-            print(f"  mt{n}: {expr}   (now {now:+.4g} = {now * step:+.1f} ms)")
+                                         self.bpm, time.monotonic(),
+                                         -player.MICROTIME_MAX_STEPS,
+                                         player.MICROTIME_MAX_STEPS)
+            print(f"  mt{n}: {expr:<20} -> {now:+.4g} steps = "
+                  f"{now * step_ms:+.1f} ms")
         print()
 
     def do_list_sus(self, arg):
         "List all configured sustain sequences of this pattern (sus0..sus9)"
-        print(f"\nSustains (pattern {self.pattern_number}, bpm {self.bpm}):")
+        step_ms = division_step_ms(self.bpm, self.division)
+        print(f"\nSustains (pattern {self.pattern_number}, "
+              f"{division_to_text(self.division)} = {step_ms:g} ms, "
+              f"bpm {self.bpm}):")
         if not self.sustains:
             print(f"  (none configured - notes are held "
-                  f"{player.SUSTAIN_FRACTION:g} of the step)")
+                  f"{player.SUSTAIN_FRACTION:g} of the step = "
+                  f"{player.SUSTAIN_FRACTION * step_ms:g} ms)")
             print()
             return
+        lfos = self._root_shell().project.get("lfos", {})
         for n in sorted(self.sustains):
-            print(f"  sus{n}: {self.sustains[n]}")
+            expr = self.sustains[n]
+            now = velocity.evaluate_span(expr, lfos, self.bpm,
+                                         time.monotonic(), 0.0,
+                                         player.SUSTAIN_MAX_STEPS)
+            print(f"  sus{n}: {expr:<20} -> {now:g} steps = "
+                  f"{now * step_ms:g} ms")
         print()
 
     def do_list_v(self, arg):
@@ -3416,7 +4675,7 @@ class PatternShell(SeqCompletingCmd):
         print()
 
     def do_list_f(self, arg):
-        "List all configured phrases of this pattern (f1..f16)"
+        "List all configured phrases of this pattern (f0..f7)"
         print(f"\nPhrases of pattern {self.pattern_number}:")
         if not self.phrases:
             print("  (none configured)")
@@ -3429,14 +4688,16 @@ class PatternShell(SeqCompletingCmd):
     def completenames(self, text, *ignored):
         names = super().completenames(text, *ignored)
         names += [f"s{i}" for i in range(10) if f"s{i}".startswith(text)]
-        names += [f"f{i}" for i in range(1, MAX_PHRASES + 1)
+        names += [f"f{i}" for i in range(MAX_PHRASES)
                   if f"f{i}".startswith(text)]
+        names += [f"o{i}" for i in range(sampler.MAX_ORDER_LISTS)
+                  if f"o{i}".startswith(text)]
         names += [f"p{i}" for i in range(1, MAX_PATTERNS + 1)
                   if f"p{i}".startswith(text)]
         return names
 
     def do_panic(self, arg):
-        "Stop all phrases and silence all MIDI outputs"
+        "Stop everything (phrases, loops) and silence MIDI/audio outputs"
         self._root_shell().panic()
 
     def do_help(self, arg):
@@ -3444,24 +4705,28 @@ class PatternShell(SeqCompletingCmd):
             return super().do_help(arg.strip().replace("-", "_"))
         print(f"\nPattern {self.pattern_number} Commands:")
         print(f"  {'s0..s9 [deg...]':<20} - set a sequence of scale degrees, e.g. s0 0 0 r 3")
+        print(f"  {'':<20}   LFO algebra: 127*lfo1 (product), 63+63*lfo1 (offset)")
         print(f"  {'':<20}   in a CC pattern the values are raw controller data 0..127")
         print(f"  {'':<20}   O/o prefixes shift octaves up/down: O0 = root +1 oct, o3 = degree 3 -1 oct")
         print(f"  {'':<20}   'r' inserts a rest")
         print(f"  {'s<k>':<20} - show one sequence of this pattern")
-        print(f"  {'f1..f16 <expr>':<20} - define a phrase, e.g. f1 4*(s0+2*s1) or inf*s0")
+        print(f"  {'f0..f7 <expr>':<20} - define a phrase (arrangement), e.g. f0 inf*s0")
+        print(f"  {'':<20}   note/CC: units are sequences (4*(s0+2*s1)); loop: order lists (2*o0+o1)")
         print(f"  {'f<k>':<20} - show one phrase of this pattern")
         print(f"  {'v<k> <expr>':<20} - velocity of sequence k (v0..v9): 45 or 64+0.4*lfo1")
         print(f"  {'':<20}   'v<k>=<expr>' is accepted too; values are clamped to 0..127")
-        print(f"  {'sus<k> <expr>':<20} - sustain share of the step (sus0..sus9): 0.5 or 0.5+0.5*lfo1")
-        print(f"  {'':<20}   'sus<k>=<expr>' works too; clamped to 0..1 of the step")
+        print(f"  {'sus<k> <length>':<20} - note length in steps (sus0..sus9): 0.5, 2, 1/4")
+        print(f"  {'':<20}   expressions too: 0.5+0.5*lfo1; clamped to 0..{player.SUSTAIN_MAX_STEPS} steps")
         print(f"  {'list-s':<20} - list all configured sequences")
         print(f"  {'list-f':<20} - list all configured phrases")
         print(f"  {'list-v':<20} - list all configured velocities")
-        print(f"  {'mt<k> <expr>':<20} - microtiming of sequence k (mt0..mt9): -0.05 or 0.01*lfo1")
-        print(f"  {'':<20}   shifts notes within the step; clamped to -0.5..0.5")
+        print(f"  {'mt<k> <offset>':<20} - microtiming in steps (mt0..mt9): 1/4, -1/8, 0.5")
+        print(f"  {'':<20}   +/-: late/early; clamped to +/-{player.MICROTIME_MAX_STEPS} steps")
         print(f"  {'list-sus':<20} - list all configured sustains")
         print(f"  {'list-mt':<20} - list all configured microtimings")
-        print(f"  {'hist [f<k>|s<k>] [live]':<20} - per-step histogram; 'live' refreshes it (hist stop ends)")
+        print(f"  {'hist [f<k>|s<k>|o<k>]':<20} - per-step histogram (loop: sample positions); add 'live'")
+        print(f"  {'':<20}   note/CC: f<k> phrase or s<k> sequence; loop: f<k> arrangement or o<k> order")
+        print(f"  {'':<20}   (loop patterns have no histogram: use list-o)")
         print(f"  {'start f<k>':<20} - play phrase k to the MIDI output (velocity 100)")
         print(f"  {'stop [f<k>]':<20} - stop the running phrase playback")
         print(f"  {'scale [<name>]':<20} - show or set the pattern scale")
@@ -3470,15 +4735,21 @@ class PatternShell(SeqCompletingCmd):
         print(f"  {'select-port':<20} - set this pattern's MIDI output port")
         print(f"  {'bpm [<value>]':<20} - set this pattern's BPM (default: inherits global)")
         print(f"  {'division [1/16]':<20} - step note value (1, 1/2, 1/3, 1/16 ...)")
-        print(f"  {'type [note|CC]':<20} - pattern kind (default: note); CC sends controller data")
+        print(f"  {'type [note|CC|loop]':<20} - pattern kind (default: note); CC = controller data")
+        print(f"  {'sample [<file.wav>]':<20} - loop pattern: choose a .wav from the samples folder")
+        print(f"  {'o0..o9 [slice...]':<20} - loop slice order, e.g. o0 0 1 4 2 5 ('r' = rest)")
+        print(f"  {'':<20}   positions are normalised (0.2 = 20 %); LFO entries work too: o0 0.2 0.5*lfo1")
+        print(f"  {'list-o':<20} - list the loop orders and the selected sample")
+        print(f"  {'start o<k> / stop o<k>':<20} - shortcut: play/stop one order list (inf*o<k>)")
+        print(f"  {'start f<k> / stop f<k>':<20} - play/stop a loop arrangement, e.g. f0 inf*o0")
         print(f"  {'controller [<n>]':<20} - CC number 0-127 used by a CC pattern")
         print(f"  {'p<m>':<20} - switch to another pattern (m = 1-16)")
         print(f"  {'t<n>':<20} - switch to another track menu")
-        print(f"  {'cp <src> <dst>':<20} - copy a track, pattern, sequence or phrase")
+        print(f"  {'cp <src> <dst>':<20} - copy a leaf/pattern; cp s0 s1 also copies v/sus/mt")
         print(f"  {'rm <path>|lfo<n>':<20} - delete a track/pattern/sequence/phrase, reset an LFO or a setting")
-        print(f"  {'panic':<20} - stop all phrases and silence all MIDI outputs")
+        print(f"  {'panic':<20} - stop all playback (phrases, loops) and silence outputs")
         print(f"  {'/':<20} - return to the main menu from anywhere")
-        print(f"  {'/ <command>':<20} - run a main-menu command and return to the top menu")
+        print(f"  {'/ <command>':<20} - run a main-menu command, staying in this menu")
         print(f"  {'help':<20} - show this help")
         print(f"  {'exit':<20} - return to track {self.parent_shell.track_number} "
               f"(playback keeps running)")
@@ -3523,25 +4794,29 @@ class PatternShell(SeqCompletingCmd):
                 self.request_root()
                 return True
             self.run_root_command(command)
-            self.request_root()
-            return True
+            return
         token, rest = parts[0], text[len(parts[0]):].strip()
         low = token.lower()
         if low.startswith("lfo"):  # jump to an LFO menu from here
             self._root_shell().onecmd(text)
             return True if self.propagate_root_request() else None
-        if low in ("cp", "rm"):  # copy / remove by path
-            self._root_shell().onecmd(text)
+        if low in ("cp", "rm"):  # copy / remove by path (relative allowed)
+            self._root_shell().onecmd(self._cp_rm_paths(text))
             return
         if low == "show":
-            self._root_shell().do_show(f"t{self._track_number()}p"
-                                       f"{self.pattern_number}{rest}")
+            target = (rest or "").strip()
+            if re.match(r"(?i)^t\d+", target):
+                # an absolute path was given: do not prefix it again
+                self._root_shell().do_show(target)
+            else:
+                self._root_shell().do_show(f"t{self._track_number()}p"
+                                           f"{self.pattern_number}{target}")
             return
         # s<k> [degrees] / f<k> [expression] / v<k> [=][expression]
         name, rest = ((token.split("=", 1)[0],
                        (token.split("=", 1)[1] + " " + rest).strip())
                       if "=" in token else (token, rest))
-        m = re.fullmatch(r"(?i)([sfv])(\d+)", name)
+        m = re.fullmatch(r"(?i)([sfvo])(\d+)", name)
         sus = None if m else re.fullmatch(r"(?i)sus(\d+)", name)
         mt = None if (m or sus) else re.fullmatch(r"(?i)mt(\d+)", name)
         if m or sus or mt:
@@ -3569,6 +4844,15 @@ class PatternShell(SeqCompletingCmd):
                     return
                 self.set_velocity(index, rest)
                 return
+            if kind == "o":
+                if not 0 <= index <= _PATH_MAX_ORDER:
+                    print(f"Error: order list must be o0..o{_PATH_MAX_ORDER}")
+                    return
+                if rest:
+                    self.set_order(index, rest.split())
+                else:
+                    self.show_order(index)
+                return
             if kind == "s":
                 if not 0 <= index <= _PATH_MAX_SEQ:
                     print(f"Error: sequence must be s0..s{_PATH_MAX_SEQ}")
@@ -3578,8 +4862,8 @@ class PatternShell(SeqCompletingCmd):
                 else:
                     self.show_sequence(index)
             else:
-                if not 1 <= index <= _PATH_MAX_PHRASE:
-                    print(f"Error: phrase must be f1..f{_PATH_MAX_PHRASE}")
+                if not 0 <= index <= _PATH_MAX_PHRASE:
+                    print(f"Error: phrase must be f0..f{_PATH_MAX_PHRASE}")
                     return
                 self.set_phrase(index, rest)
             return
@@ -3592,7 +4876,10 @@ class PatternShell(SeqCompletingCmd):
         try:
             path = parse_compact_path(token, track=self._track_number(),
                                       pattern=self.pattern_number)
-        except ValueError:
+        except ValueError as e:
+            if _PATH_TOKEN_RE.fullmatch(token):
+                print(f"Error: {e}")
+                return
             hint = old_command_hint(token)
             print(f"*** Unknown command: {line}")
             if hint:
@@ -3617,6 +4904,12 @@ class PatternShell(SeqCompletingCmd):
             return
         if path["kind"] == "f":
             self.set_phrase(path["index"], rest)
+            return
+        if path["kind"] == "o":
+            if rest:
+                self.set_order(path["index"], rest.split())
+            else:
+                self.show_order(path["index"])
             return
         if rest:
             try:
