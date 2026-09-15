@@ -184,17 +184,40 @@ class _OutputPool:
 _output_pool = _OutputPool()
 
 
+class MidiEmitter:
+    """Sends note on/off and control changes to a winmm MIDI port."""
+
+    def __init__(self, player):
+        self.player = player
+
+    def note_on(self, note, velocity, hold, when, seq_index=None):
+        self.player._send(0x90, note, velocity)
+
+    def note_off(self, note):
+        self.player._send(0x80, note, 0)
+
+    def control(self, controller, value, when, seq_index=None):
+        self.player._send(0xB0, controller, value)
+
+    def close(self):
+        pass
+
+
 class Player:
-    """Plays a step plan on a MIDI output port in a background thread.
+    """Plays a step plan in a background thread.
 
     resolver(step) maps a plan entry to a MIDI note number; it may return
     None (e.g. for rests) to skip the note while keeping the step timing.
+
+    Output goes through an *emitter*: MidiEmitter (the default) sends to a
+    winmm port, an OSC emitter sends SuperCollider events, so both transports
+    share the whole scheduling / live-editing machinery.
     """
 
     def __init__(self, port_name, channel, step_time, plan, infinite, resolver,
                  provider=None, velocity_resolver=None,
                  sustain_resolver=None, microtime_resolver=None,
-                 mode="note", controller=1):
+                 mode="note", controller=1, emitter=None, owns_port=True):
         self.port_name = port_name
         self.channel = channel
         self.step_time = step_time
@@ -217,11 +240,23 @@ class Player:
         self.mode = mode
         self.controller = controller
         self.error = None
+        self._owns_port = owns_port
         self._stop_event = threading.Event()
         self._finished = threading.Event()
 
         # Share one device handle per port so several players can run together.
-        self._handle = _output_pool.acquire(port_name)
+        self._handle = _output_pool.acquire(port_name) if owns_port else None
+        # The emitter performs the output: MIDI by default, OSC for
+        # SuperCollider patterns. It receives already resolved note events.
+        self.emitter = emitter or MidiEmitter(self)
+        refresh = getattr(self.emitter, "refresh", None)
+        if refresh is not None and provider is not None:
+            try:
+                spec = list(provider())
+                if len(spec) > 7:
+                    refresh(spec[7])
+            except Exception:
+                pass
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -247,9 +282,14 @@ class Player:
         if self.provider is None:
             return
         try:
+            spec = list(self.provider())
             (self.plan, self.infinite, self.step_time, self.resolver,
-             self.channel, self.mode, self.controller) = self.provider()
+             self.channel, self.mode, self.controller) = spec[:7]
             self.sustain = self.step_time * SUSTAIN_FRACTION
+            extra = spec[7] if len(spec) > 7 else None
+            refresh = getattr(self.emitter, "refresh", None)
+            if refresh is not None:
+                refresh(extra)
         except Exception as e:
             print(f"Note: could not refresh the playing phrase ({e}); "
                   f"continuing with the previous cycle.")
@@ -265,12 +305,12 @@ class Player:
             """Send the note-offs whose length has elapsed by 'now'."""
             while pending and pending[0][1] <= now:
                 note, _due = pending.pop(0)
-                self._send(0x80, note, 0)
+                self.emitter.note_off(note)
 
         def release_all():
             while pending:
                 note, _due = pending.pop(0)
-                self._send(0x80, note, 0)
+                self.emitter.note_off(note)
 
         def wait_until(target):
             """Sleep until 'target', releasing note-offs that fall due first.
@@ -333,8 +373,9 @@ class Player:
                         continue
                     if self.mode == "cc":
                         # Control change: the resolved value is the datum.
-                        self._send(0xB0, max(0, min(127, self.controller)),
-                                   note)
+                        self.emitter.control(
+                            max(0, min(127, self.controller)), note,
+                            time.monotonic(), seq_index)
                         grid += self.step_time
                         continue
                     if self.velocity_resolver is not None:
@@ -347,7 +388,10 @@ class Player:
                         share = SUSTAIN_FRACTION
                     hold = self.step_time * max(
                         0.0, min(SUSTAIN_MAX_STEPS, share))
-                    self._send(0x90, note, velocity)
+                    # Hand the resolved event to the emitter: MIDI sends a
+                    # note on/off pair, OSC sends one SuperCollider bundle.
+                    self.emitter.note_on(note, velocity, hold, target,
+                                         seq_index)
                     pending.append([note, now + hold])
                     pending.sort(key=lambda item: item[1])
                     release_due(time.monotonic())  # e.g. a zero-length note
@@ -363,7 +407,12 @@ class Player:
                 release_all()  # never leave a note hanging
             except Exception:
                 pass
+            try:
+                self.emitter.close()
+            except Exception:
+                pass
             # The device handle is shared; keep it open while other players
             # still use the same port.
-            _output_pool.release(self.port_name)
+            if self._owns_port:
+                _output_pool.release(self.port_name)
             self._finished.set()

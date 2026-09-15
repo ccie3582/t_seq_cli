@@ -206,6 +206,51 @@ Degrees are **scale-relative**: `s0 1 2 3 4` in `chromatic` gives `C#4 D4 D#4 E4
 and after `scale dorian` the very same sequence plays `D4 Eb4 F4 G4`. Degrees at
 or beyond the scale size wrap into the next octave (`s0 7` in a 7-note scale =
 root one octave up), so no step is ever silently dropped.
+
+#### Where the scales come from
+
+`scales.py` holds (a) a curated, **named** list and (b) the **complete catalogue
+of set classes** for 5, 6 and 7 notes, generated and verified (38 / 50 / 38
+classes, the published counts for those cardinalities):
+
+```
+seq:t1p1> scale ?
+Named scales (aliases accepted, 5/6/7 notes):
+  aeolian altered augmented blues chromatic chromatic-hexachord dorian …
+Catalogue of set classes (126 generated, complete for those note counts):
+  5 notes: pent-01..pent-38   (38 classes, prefix 'pent')
+  6 notes: hex-01..hex-50     (50 classes, prefix 'hex')
+  7 notes: hept-01..hept-38   (38 classes, prefix 'hept')
+
+seq:t1p1> scale ? 6             # one cardinality, with prime forms and vectors
+Set classes matching '6' (50):
+  hex-01   (0,1,2,3,4,5)            vector 543210  modes 6   [chromatic-hexachord]
+  hex-02   (0,1,2,3,4,6)            vector 443211  modes 6
+  …
+seq:t1p1> scale hex-07@3        # a mode of a class (0 = the prime form)
+Scale set: hex-07@3 on C4: C4 D4 F4 A4 A#4 B4
+seq:t1p1> scale 0,2,4,7,9       # or just give the semitone offsets
+Scale set: custom-0-2-4-7-9 on C4: C4 D4 E4 G4 A4   (custom interval list)
+```
+
+* The **named** scales are the common ones: the major modes and the harmonic /
+  melodic minor families, plus `whole-tone`, `augmented`, `hexatonic`, `blues`,
+  `major-blues`, `prometheus`, `tritone`, `persian`, and the pentatonics
+  (`major-pentatonic`, `minor-pentatonic`, `egyptian`, `hirajoshi`, `insen`,
+  `yo`, `iwato`, `kumoi`, `pelog`). Aliases work too (`minor`, `gypsy`,
+  `spanish`, `romanian`, `hijaz`, `japanese`, `major-pent`, …).
+* The **catalogue** is the full set-class content (`pent-`/`hex-`/`hept-`),
+  complete for those note counts: every 5-, 6- and 7-note pitch-class set is
+  reachable, either directly or through one of its modes. Entries are named by
+  prime form order (our own numbering, not the Forte numbers); the listing shows
+  the prime form, the interval vector, how many modes it has, and any named
+  scales that share the class — e.g. `hept-38` *is* the diatonic set:
+  `vector 254361  [aeolian, dorian, ionian, locrian, lydian, mixolydian,
+  phrygian]`.
+* Rooted in the listing at `allthescales.org` (see the `scales.py` docstring),
+  which is where the 7-note named scales came from; the 6-note and the complete
+  classes are generated from the set theory behind that listing rather than
+  copied row by row, so the data is exact and checkable.
 | `O…`, `o…` | octave up/down prefixes (`O0`, `o3`); in CC mode they add ±12 |
 | `r` | rest — the step is skipped (no note, no CC) |
 | `A*lfo1` | multiplication: value = `round(A × lfo1)` |
@@ -283,11 +328,16 @@ and stops by itself.
 ### 4.3 Value sequences — velocity `v0…v9`, sustain `sus0…sus9`, microtiming `mt0…mt9`
 
 These attach to the **sequence with the same index**: notes coming from `s2` use
-`v2`, `sus2` and `mt2`. Each accepts a number **or an LFO expression**:
+`v2`, `sus2` and `mt2`. Each accepts a number **or an LFO expression**.
+
+In a **loop pattern** the same `v0…v9` work: they attach to the **order list with
+the same index**, so `v0` is the velocity of `o0` and controls the **volume** of
+the sample played by those steps (`v1 32` = quiet, `v1 100+27*lfo1` = swelling).
+`sus`/`mt` do not apply to a sample (the next step already cuts it).
 
 | Sequence | Meaning | Range (clamped) | Default |
 |---|---|---|---|
-| `v<k>` | MIDI velocity | `0..127` (integer) | `100` |
+| `v<k>` | MIDI velocity — or the volume of `o<k>` in a loop pattern | `0..127` (integer) | `100` |
 | `sus<k>` | note length, **in steps** (`0.5`, `2`, `1/4`) | `0..8` steps | `0.5` |
 
 Fractions also work inside expressions, for both values and LFO coefficients —
@@ -322,12 +372,13 @@ list-v, list-sus, list-mt
 `mt` values are shown in milliseconds wherever the step length is known
 (`mt0 0.1` at `1/16`, 120 BPM → `+25.0 ms`).
 
-### 4.4 Pattern type: note, CC or loop
+### 4.4 Pattern type: note, CC, loop or osc
 
 ```
-type                     # "Type: note", "Type: CC (controller 74)" or "Type: loop"
+type                     # "Type: note", "Type: CC (controller 74)", "Type: loop", "Type: osc"
 type CC                  # this pattern sends control-change data (also: type note)
 type loop                # this pattern plays positions of a .wav sample (see 4.5)
+type osc                 # this pattern sends SuperCollider events (see 4.6)
 controller 74            # CC number 0..127 used by a CC pattern
 ```
 
@@ -337,7 +388,7 @@ phrases weights, division, BPM, microtiming, channel, port, `cp`/`rm`,
 
 * a sequence value is the **CC data byte** (`0..127`, scale-independent),
 * every step sends `CC(controller, value)` on the pattern's channel/port,
-* **no note on/off** is sent, velocity and sustain sequences are not used,
+* **no note on/off** is sent, so velocity and sustain sequences are not used,
 * the number of controllers is unlimited: use several CC patterns.
 
 ```
@@ -420,8 +471,20 @@ start o0                 # shortcut: play one order list (same as inf*o0)
   and the arrangements (`phrase-<k> = inf*o0`) in the pattern section; `cp o0 o1`
   copies an order list (and `cp t1p1o0 t3p4o1` across patterns), `rm t1p1o0`
   deletes one.
+* `v<k>` sets the **volume** of the steps that come from order list `o<k>` (same
+  numbering as note patterns), and it may be an LFO expression: `v0 100`,
+  `v1 32`, `v0 100+27*lfo1`. The value scales the played sample through the audio
+  device's volume, so `v=0` is silent and `v=127` is full level. `list-v` and the
+  histogram show it, and it can be edited live like everything else.
+
+  ```
+  seq:t1p3> v1 32
+  v1 set: 32   (now 32; scales o1)
+  ```
+
 * `hist` works here too, on the same horizontal layout: one row per step with the
-  sample's length as the axis (0 at the left, 1 at the right). The marker is the
+  sample's length as the axis (0 at the left, 1 at the right); a `v<k>` column
+  appears when the steps use a velocity. The marker is the
   position the step plays from and the short line after it is what is actually
   heard - the sample runs only until the next step (or the end of the file):
 
@@ -429,11 +492,13 @@ start o0                 # shortcut: play one order list (same as inf*o0)
   seq:t1p3> hist o0 live
   o0  step 250 ms  bpm 120  division 1/8  Motorway.wav   (live)   step 3
 
-          0               1/4             1/2            3/4             1
-          |---------------|---------------|--------------|---------------|
-    s1    ......*-----....................................................  0.094
-    s2    ................................*----...........................    0.5
-    s3    .........................................................*----..    0.9
+          0             1/4           1/2            3/4           1
+          |-------------|-------------|--------------|-------------|
+    s1    .....*-----...............................................  0.094  v100
+    s2    ............................*-----........................    0.5  v100
+    s3    ...................................................*-----.    0.9  v100
+    s4    ...........*-----.........................................    0.2   v32
+    s5    ........................................*----.............    0.7   v32
   ```
 
   With a step longer than the sample the line runs to the right edge (the whole
@@ -462,7 +527,112 @@ seq> stop t1p1o0
 Loop stopped.
 ```
 
-### 4.6 Other pattern settings
+### 4.6 OSC patterns (SuperCollider)
+
+An **osc pattern** plays the same sequences and phrases as a note pattern, but
+sends **SuperCollider** events over OSC instead of MIDI: one time-tagged bundle
+per step, scheduled on the pattern's grid, carrying the pitch, the amplitude
+(from `v<k>`), the length (from `sus<k>`) and any effect parameters you define.
+
+```
+type osc                  # this pattern sends to SuperCollider
+osc 127.0.0.1:57110       # scsynth server (default, so optional)
+sclang 127.0.0.1:57120    # sclang, used to install SynthDefs (default)
+synth seq                 # the SynthDef to play (default 'seq')
+synthdef seq              # send a definition: writes synthdefs/seq.scd -> sclang
+fx cutoff 2000+1500*lfo1  # effect parameters, LFO expressions welcome
+fx reverb 0.3
+fx                        # list them (with the value they resolve to now)
+rm t1p1 fx cutoff         # clear one
+s0 0 2 4 7                # sequences, exactly like a note pattern
+v0 90                     # velocity -> amp
+sus0 2                    # length in steps -> dur (seconds)
+f0 inf*s0                 # phrases as usual
+start f0                  # play it
+dump on                   # record the OSC packets (then 'dump' to print them)
+status                    # ask the server for /status (is it running?)
+```
+
+* **Timing / 'late' messages**: bundles are scheduled `latency` seconds in the
+  future (`latency 0.2` is the default, FoxDot uses 0.25). scsynth posts
+  `late <t>` whenever a scheduled message arrives after its time, so raise it if
+  you see those (`latency 0.3`), or lower it for tighter feel (`latency 0.05`
+  still arrives ~48 ms early on a local machine):
+
+  ```
+  seq:t1p1> latency
+  latency: 0.2 s (default)
+  seq:t1p1> latency 0.05
+  latency set to 0.05 s (applies at the next cycle of any playing osc pattern)
+  ```
+* **Notes** become a bundle at the scheduled time:
+  `/s_new <synth> <node> 1 1 midinote <n> freq <Hz> amp <v/127> dur <seconds>
+  <fx…>` — the layout FoxDot uses, except that the SynthDef's own envelope frees
+  the node (no groups to clean up). `dump` shows exactly what goes on the wire:
+
+  ```
+  bundle(t=1789397464.508) [/s_new seq 2000 1 1 midinote 60 freq 261.626 amp 0.787402 dur 0.0625 cutoff 2000]
+  ```
+* **FX parameters** are per note, may be LFO expressions, and are clamped to a
+  sensible range per name (`cutoff 20..20000`, `resonance 0.05..1`, `drive
+  0.05..8`, `delay 0..1`, `reverb 0..1`, `pan -1..1`); an unknown name is passed
+  through for your own SynthDef. Editing `fx`/`synth` while playing takes effect
+  at the **next cycle**, like every other pattern edit.
+* **A catalogue of SynthDefs ships with the sequencer** (`scdefs.py`, like
+  FoxDot's `_SynthDefs.py`). `synthdef` lists it, and **`synthdef all` installs
+  every one of them in one shot**: missing files are written to `synthdefs/`,
+  then all of them are concatenated into `synthdefs/_all.scd` and that single
+  path goes to sclang on one `/seqd` message. Then each pattern chooses what it
+  plays with `synth <name>`:
+
+  ```
+  seq:t1p1> synthdef
+  Built-in SynthDefs (send them all with 'synthdef all'):
+      seq     saw + pulse through a resonant lowpass (the default)
+      bass    round sub bass: triangle plus saw, driven
+      pad     soft detuned saw pad with a slow filter
+      pluck   plucked string: an impulse into a tuned comb filter
+      bell    FM bell with inharmonic partial and a long tail
+      fm, blip, noise, perc, glass, growl, organ, stab
+  seq:t1p1> synthdef all
+  Sent 13 SynthDefs to sclang at 127.0.0.1:57120 as one file:
+    C:\CLI_1\synthdefs\_all.scd
+  seq:t1p1> synth bass
+  synth set to 'bass'   (round sub bass: triangle plus saw, driven) ...
+  ```
+
+  The output stage is deliberately **cheap** (no `FreeVerb` — 8 delay lines —
+  and no 1-second `DelayC` per note): the echo is a short feedback comb and the
+  space a two-comb + allpass tail, both scaled by their control, so dozens of
+  notes can sound at once. All of them accept the same controls (`freq amp dur
+  pan atk rel cutoff resonance drive delay reverb`) plus a few extras of their own (`bell`:
+  `ratio`/`index`/`decay`, `pad`/`stab`: `detune`, `blip`: `numharm`), and only
+  core UGens are used, so no sc3-plugins are needed. Different patterns can play
+  different SynthDefs at the same time, at their own divisions:
+
+  ```
+  bundle(t=…) [/s_new bass 2000 1 1 midinote 60 freq 261.626 amp 0.787402 dur 0.125]
+  bundle(t=…) [/s_new bell 2001 1 1 midinote 67 freq 391.995 amp 0.787402 dur 0.25]
+  bundle(t=…) [/s_new pad  2002 1 1 midinote 63 freq 311.127 amp 0.787402 dur 0.5]
+  ```
+* `synthdef <name>` installs a single one (and writes `synthdefs/<name>.scd` if
+  missing), `synthdef <name> myfile.scd` sends a file you wrote instead. Those
+  files are the editable sources: change one and `synthdef <name>` re-sends it,
+  while `synthdef all` keeps your edits and only writes what is missing.
+* **How they reach sclang**: the source file's **path** is sent to the address
+  `/seqd`. Run the shipped bridge once in SuperCollider (after `s.boot`) so that
+  responder exists:
+
+  ```supercollider
+  File("C:/CLI_1/sc/seqd.scd".standardizePath).load;
+  ```
+  It prints `[seqd] loading SynthDef from …` for every definition you send.
+  `synthdef <name> mydef.scd` sends an existing file from `synthdefs/` instead.
+* `panic` (and `exit`) free the SuperCollider nodes as well as stopping MIDI and
+  sample playback; `status` reports synths/groups/SynthDefs/CPU when a server is
+  listening and explains what to do when there is none.
+
+### 4.7 Other pattern settings
 
 ```
 scale [<name>]        # chromatic (default); 'scale ?' lists all scales
@@ -473,7 +643,7 @@ division [1/16]       # step note value
 select-port           # choose this pattern's output port (default: global)
 ```
 
-### 4.7 Playback from the pattern menu
+### 4.8 Playback from the pattern menu
 
 ```
 start f1              # start phrase 1
@@ -481,7 +651,7 @@ stop                  # stop this pattern's playback
 stop f1               # stop phrase 1 of this pattern
 ```
 
-### 4.8 Histogram view — `hist`
+### 4.9 Histogram view — `hist`
 
 A per-step view of what the phrase plays, one column per division step:
 
@@ -568,6 +738,57 @@ are highlighted in green. In a note pattern a sequence is resolved to note
 names; in a CC pattern the values are printed as numbers.
 
 ---
+
+### 5.3 MIDI clock (24 PPQN) — following or driving external gear
+
+The sequencer can **send** its tempo as MIDI clock to an output port, or
+**receive** clock from an input port and follow it. It is a global setting
+(saved in `[global]` of the .cfg).
+
+```
+seq> clock                 # state, plus the input and output ports found
+seq> clock port out 0      # the port used for send (name or index)
+seq> clock port in 1
+seq> clock send            # we are the master: 24 PPQN + Start/Stop
+seq> clock receive         # we are the slave: the clock sets the global BPM
+seq> clock start received  # a MIDI Start starts every configured pattern
+seq> clock off
+```
+
+* **24 PPQN**: one `0xF8` per 24th of a quarter note, so at 120 BPM that is 48
+  ticks per second. The tick interval follows the live global BPM (change it
+  while sending and the gear follows).
+* **Send**: Start (`0xFA`) is emitted when playback begins and Stop (`0xFC`)
+  when nothing is playing any more (a `panic` sends Stop too).
+* **Receive**: the ticks are averaged (last 24) to estimate the tempo, which is
+  written to the global BPM; `clock` shows the estimate and the tick count, and
+  a lost clock (no ticks for 0.5 s) is reported as "waiting for ticks".
+* **`clock start received`** is the interesting one: an incoming MIDI Start
+  launches **every configured pattern** — for each pattern the lowest phrase
+  (`f<k>`, or an order list `o<k>` for loop patterns), skipping patterns that
+  have no phrase:
+
+  ```
+  seq> clock start received
+  clock start: received  (MIDI Start starts all configured patterns)
+  seq> start-all            # the same thing by hand, to test it
+  Clock start: started 2 pattern(s): t1p1, t1p2
+    (no phrase configured in: t2p1)
+  ```
+  In `internal` mode (the default) MIDI Start is ignored and only your own
+  `start`/`stop` commands control playback.
+* `show` starts with the global line so you can see the mode at a glance:
+
+  ```
+  Global: bpm 120, port TestPort, clock send on Microsoft GS Wavetable Synth
+  ```
+
+Ports are listed by number and name (`clock port` with no argument shows both
+directions); the direction is taken from the mode, or given explicitly with
+`in`/`out`. A number is resolved to the port's real name (never stored as a
+bare index, which would break if the device list changes), and if the index is
+out of range or no device is enumerated at that moment you get an error and
+nothing is changed.
 
 ## 6. LFOs (8 global oscillators)
 
@@ -747,6 +968,10 @@ reads it back. Only non-default settings are written.
 ```ini
 [global]
 bpm = 120
+port = Elektron Digitone          # the selected MIDI output port
+clock-mode = send                 # off | send | receive
+clock-port = Elektron Digitone
+clock-start = internal            # internal | received
 
 [lfo-1]
 frequency = 2bpm
@@ -756,7 +981,7 @@ running = true
 
 [track-1:pattern-1]
 seq-0 = 0 2 4 r
-seq-1 = 0*5*lfo1 7
+seq-1 = 0+5*lfo1 7      # '0*5*lfo1' would multiply out to 0 (products bind first)
 phrase-1 = inf*(s0+1*s1)
 velocity-0 = 90
 velocity-1 = 64+0.4*lfo1
@@ -765,15 +990,39 @@ microtime-0 = -0.02
 division = 1/8
 type = cc
 controller = 74
+
+[track-1:pattern-2]               # a loop pattern
+type = loop
+sample = Motorway.wav
+order-0 = 0.2 0.6
+phrase-0 = inf*o0
+velocity-0 = 60
+
+[track-1:pattern-3]               # an osc pattern
+type = osc
+osc-server = 127.0.0.1:57110
+osc-sclang = 127.0.0.1:57120
+osc-latency = 0.2
+synth = bell
+fx-cutoff = 2000+1500*lfo1
+fx-reverb = 0.3
 ```
 
 Notes:
 * `bpm`, `scale`, `root`, `channel`, `port`, `type`, `division` are omitted when
   they equal their defaults; the global `bpm` is always written.
 * The selected output port is stored as `port = <name>` in `[global]` (omitted
-  while no port is selected).
+  while no port is selected), and the MIDI clock settings as `clock-mode`,
+  `clock-port`, `clock-start` (see 5.3).
 * LFOs saved as `running = true` are re-armed at load: they start at the next
   beat from their stored phase.
+* Loop and osc patterns no longer write `controller` (it only applies to `type
+  cc`), and sequence text is stored canonically: the LFO terms are products, so
+  an offset is written with a sum (`0+5*lfo1`, not `0*5*lfo1`).
+* Loop patterns keep `sample` and one `order-<k>` per order list; osc patterns
+  keep `osc-server`, `osc-sclang`, `osc-latency`, `synth` and one `fx-<name>`
+  per effect parameter (scale, sequences, phrases, v/sus/mt and division are the
+  same keys as for note patterns).
 
 ---
 
@@ -785,9 +1034,13 @@ seq> panic          # stop every phrase and send All Sound Off (CC120) +
                     # reachable port
 ```
 
-`panic` is available in **every** menu (main, track, pattern, LFO). Playback
-otherwise survives navigation: leaving a pattern or track keeps phrases running
-until you `stop`, `panic`, or exit the program.
+`panic` is available in **every** menu (main, track, pattern, LFO). It also
+sends `Stop` (`0xFC`) on the MIDI clock output and frees the SuperCollider nodes
+(`/g_freeAll`, `/clearSched`) of every server in use, so OSC patterns stop too.
+`exit` does the same cleanup (without the MIDI panic bytes).
+
+Playback otherwise survives navigation: leaving a pattern or track keeps phrases
+running until you `stop`, `panic`, or exit the program.
 
 Multiple phrases (and multiple CC patterns) can play **simultaneously** on the
 same port and channel — the sequencer shares one device handle per port and each
@@ -799,21 +1052,33 @@ player is independent.
 
 **Main (`seq>`)**
 `bpm`, `list-ports`, `select-port`, `lfo <n>`, `lfo<n> start|stop`,
-`lfo<n> <param> …`, `status-lfo`, `start <path>`, `stop <path>`, `show [<path>]`,
-`cp`, `rm`, `save`, `load`, `panic`, `help`, `exit`, `<path> …` (edit by path).
+`lfo<n> <param> …`, `status-lfo`, `start <path>`, `stop <path>`, `start-all`,
+`show [<path>]`, `clock […]`, `cp`, `rm`, `dump`, `status`, `save`, `load`,
+`panic`, `help`, `exit`, `<path> …` (edit by path).
+
+* `clock` — MIDI clock: `clock send | receive | off`, `clock port [in|out]
+  <name|index>`, `clock start internal|received` (see 5.3).
+* `dump` / `status` — inspect the OSC traffic and ping the SuperCollider server
+  (see 4.6).
 
 **Track (`seq:t1>`)**
-`p<m>`, `p<m>s<k> …`, `p<m>f<k> …`, `p<m> division/type/controller/scale/root/bpm/channel …`,
-`show [p<m>[s<k>|f<k>]]`, `start p<m>f<k>`, `stop p<m>f<k>`, `t<n>`, `cp`, `rm`,
-`panic`, `help`, `/`, `/ <command>`, `exit`.
+`p<m>`, `p<m>s<k> …`, `p<m>f<k> …`, `p<m>o<k> …`,
+`p<m> division/type/controller/scale/root/bpm/channel/sample/osc/synth/fx/latency …`,
+`show [p<m>[s<k>|f<k>|o<k>]]`, `start p<m>f<k>`, `stop p<m>f<k>`, `t<n>`, `cp`,
+`rm`, `panic`, `help`, `/`, `/ <command>`, `exit`.
 
 **Pattern (`seq:t1p1>`)**
-`type`, `controller`, `division`, `scale`, `root`, `bpm`, `channel`,
-`select-port`, `s<k> [tokens…]`, `f<k> <expr>`, `v<k> <expr>`, `sus<k> <expr>`,
-`mt<k> <expr>`, `list-s`, `list-f`, `list-v`, `list-sus`, `list-mt`,
-`hist [f<k>|s<k>|o<k>] [live|once|stop]`, `start f<k>`, `stop [f<k>]`, `p<m>`,
-`t<n>`,
-`cp`, `rm`, `panic`, `help`, `/`, `/ <command>`, `exit`.
+`type [note|CC|loop|osc]`, `controller`, `division`, `scale [<name>|?]`, `root`,
+`bpm`, `channel`, `select-port`, `s<k> [tokens…]`, `f<k> <expr>`,
+`v<k> <expr>`, `sus<k> <expr>`, `mt<k> <expr>`, `o<k> <positions…>`,
+`list-s`, `list-f`, `list-v`, `list-sus`, `list-mt`, `list-o`,
+`hist [f<k>|s<k>|o<k>] [live|once|stop]`, `start f<k>` / `stop [f<k>]`,
+`start o<k>` / `stop o<k>`, `sample [<file.wav>]`, `p<m>`, `t<n>`, `cp`, `rm`,
+`panic`, `help`, `/`, `/ <command>`, `exit`.
+
+For an **osc pattern** also: `osc [<host>:<port>]`, `sclang [<host>:<port>]`,
+`synth [<name>]`, `synthdef [all|<name> [file]]`, `fx [<name> <expr>]`,
+`latency [<seconds>]`, `dump [on|off]`, `status` (see 4.6).
 
 **LFO (`seq:lfo:1>`)**
 `frequency`, `shape`, `phase`, `start`, `stop`, `live [stop]`, `show`,
@@ -833,6 +1098,9 @@ player is independent.
 | Nothing sounds | No output port selected (`select-port`), or the phrase is a rest-only sequence. |
 | Notes stick | `panic` (sends All Sound Off / All Notes Off on all channels). |
 | A pattern sends no notes | Its `type` is `CC` — check with `type` and switch back with `type note`. |
+| `status` says no `/status.reply` | No SuperCollider server is listening on that host:port — start scsynth (`s.boot`) or point `osc` at the right one. |
+| SuperCollider prints `late <t>` | The OSC bundles arrive after their time tag: raise the slack with `latency 0.3` (default 0.2, FoxDot-style). |
+| A MIDI clock port will not open | Another program holds it (winmm error reported); pick another port with `clock port out <name>` / `in <name>`. |
 
 ---
 
@@ -842,9 +1110,14 @@ player is independent.
 |---|---|
 | `seq.py` | shells (main/track/pattern/LFO), commands, views, save/load |
 | `player.py` | playback threads, step grid, note/CC output, `panic_ports` |
+| `midiclock.py` | MIDI clock (24 PPQN) send/receive and Start/Stop over winmm |
 | `sampler.py` | wav loading and position playback (`winmm waveOut`) for loop patterns |
 | `lfo.py` | waveform evaluation, frequency/phase parsing, LFO graph |
 | `velocity.py` | expression grammar for velocity / sustain / microtiming |
+| `osc.py` | minimal OSC 1.0 encoder/decoder and UDP client |
+| `supercollider.py` | SuperCollider notes, FX and SynthDef handling |
+| `scdefs.py` | catalogue of built-in SynthDefs (like FoxDot `_SynthDefs.py`) |
+| `sc/seqd.scd` | SuperCollider side bridge: compiles the SynthDefs we send |
 | `phrases.py` | phrase expression parser and canonicaliser |
-| `scales.py` | scales, note names and MIDI numbers |
+| `scales.py` | named scales + complete 5/6/7-note set-class catalogue, note names, MIDI numbers |
 | `midi_ports.py`, `list-ports.py` | MIDI port discovery helpers |

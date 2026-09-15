@@ -193,11 +193,27 @@ class _Device:
             raise RuntimeError("cannot open the audio device "
                                f"(waveOutOpen error {result})")
 
-    def play(self, position):
+    def volume(self, velocity=None):
+        """Set the device volume from a MIDI velocity (0..127), None = full.
+
+        Uses waveOutSetVolume, the amplitude control of the output device, so a
+        velocity scales the whole played fragment without copying the buffer.
+        Drivers that do not support volume simply keep full volume.
+        """
+        if velocity is None:
+            level = 0xFFFF
+        else:
+            value = max(0.0, min(127.0, float(velocity)))
+            level = int(round(value / 127.0 * 0xFFFF))
+        return _winmm.waveOutSetVolume(self.handle,
+                                       ctypes.c_uint(level | (level << 16))) == 0
+
+    def play(self, position, velocity=None):
         """Start playing from a normalised position, cutting the previous one."""
         if self._closed:
             return
         self._release()
+        self.volume(velocity)
         offset = self.sample.frame_offset(position)
         length = len(self.sample.frames) - offset
         if length <= 0:
@@ -262,8 +278,10 @@ class LoopPlayer(threading.Thread):
     provider() is called once per cycle and returns
     (sample, order, step_time, label) where
       sample    a sampler.Sample
-      order     list of normalised positions (None = rest); an item may also be
-                a callable(now) -> position|None, evaluated at each step
+      order     list of normalised positions (None = rest). An item may be a
+                (position, velocity) pair, and a callable(now) returning either
+                form, evaluated at every step (LFO-driven positions, velocity
+                scales the volume of the sample)
       step_time seconds per step
       label     short description used in messages
     Returning None (or an empty order) pauses the loop until the next cycle.
@@ -341,8 +359,11 @@ class LoopPlayer(threading.Thread):
                     value = item(time.monotonic()) if callable(item) else item
                 except Exception:
                     value = None      # a bad entry is silence, not a crash
+                velocity = None
+                if isinstance(value, tuple):
+                    value, velocity = value
                 if value is not None:
-                    self._device.play(float(value))
+                    self._device.play(float(value), velocity)
                 grid += step_time
                 delay = grid - time.monotonic()
                 if delay > 0:

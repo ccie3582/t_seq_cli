@@ -30,11 +30,14 @@ import time
 
 import lfo
 import midi_ports
+import midiclock
 import velocity
 import phrases
 import player
 import sampler
 import scales
+import scdefs
+import supercollider
 
 try:
     import pyreadline3 as readline
@@ -87,7 +90,7 @@ _PATH_TOKEN_RE = re.compile(
 _PATH_MAX_SEQ = 9   # sequences are s0..s9
 _PATH_MAX_PHRASE = MAX_PHRASES - 1   # f0..f7
 _PATH_MAX_ORDER = sampler.MAX_ORDER_LISTS - 1   # order lists are o0..o9
-PATTERN_TYPES = ("note", "cc", "loop")
+PATTERN_TYPES = ("note", "cc", "loop", "osc")
 
 
 def parse_compact_path(text, track=None, pattern=None):
@@ -158,6 +161,16 @@ def old_command_hint(token):
     if re.fullmatch(r"seq\d+", low):
         return f"use {low.replace('seq', 's')} <degrees> (e.g. s0 0 1 3)"
     return None
+
+
+def _intervals_text(intervals):
+    """'(0,2,4,7,9)' for a scale."""
+    return "(" + ",".join(str(iv) for iv in intervals) + ")"
+
+
+def _vector_text(intervals):
+    """Interval vector as digits, e.g. '254361'."""
+    return "".join(str(count) for count in scales.interval_vector(intervals))
 
 
 def parse_bpm(arg):
@@ -696,13 +709,27 @@ def loop_histogram_lines(view, lfos, bpm, now, expr=None, label=None,
     refs = sorted({ref for _index, entry in plan if isinstance(entry, str)
                    for _coef, ref in variation_terms(parse_seq_expr(entry)[1])})
 
+    velocities = []
+    vel_expressions = view.get("velocities") or {}
+    for index, _entry in plan:
+        vexpr = vel_expressions.get(index)
+        if not vexpr:
+            velocities.append(None)
+            continue
+        try:
+            velocities.append(velocity.evaluate(vexpr, lfos, bpm, now))
+        except ValueError:
+            velocities.append(None)
+    uses_velocity = any(v is not None for v in velocities)
+
     width = _term_width()
     rows = len(values)
     shown = min(rows, _HIST_POS_ROWS) if width else rows
     truncated_rows = shown < rows
     indent, label_w, value_w = 2, 6, 7
+    vel_w = 6 if uses_velocity and not truncated_rows else 0
     if width:
-        axis_w = max(16, width - indent - label_w - value_w - 1)
+        axis_w = max(16, width - indent - label_w - value_w - vel_w - 1)
     else:
         axis_w = 44
 
@@ -791,8 +818,12 @@ def loop_histogram_lines(view, lfos, bpm, now, expr=None, label=None,
             tag = ">" + tag[1:]
         value = values[i]
         text = "rest" if value is None else f"{value:.3f}".rstrip("0").rstrip(".")
+        vel_text = ""
+        if vel_w:
+            vel = velocities[i]
+            vel_text = f"{'v' + str(vel):>{vel_w}}" if vel is not None else " " * vel_w
         lines.append(f"{' ' * indent}{tag:<{label_w}}{axis_for(value)}"
-                     f"{text:>{value_w}}")
+                     f"{text:>{value_w}}{vel_text}")
     if width:
         lines = [line[:max(1, width - 1)] for line in lines]
     return lines
@@ -1016,7 +1047,7 @@ def parse_seq_canonical(text):
     return cleaned
 
 
-def save_project_file(path, bpm, out_port, tracks, lfos=None):
+def save_project_file(path, bpm, out_port, tracks, lfos=None, clock=None):
     """Write the whole project state to an INI-style .cfg file."""
     import configparser
 
@@ -1026,6 +1057,12 @@ def save_project_file(path, bpm, out_port, tracks, lfos=None):
     cfg.set("global", "bpm", str(bpm))
     if out_port:
         cfg.set("global", "port", out_port)
+    clock = clock or {}
+    cfg.set("global", "clock-mode", clock.get("mode") or midiclock.MODE_OFF)
+    cfg.set("global", "clock-start",
+            clock.get("start_mode") or midiclock.START_INTERNAL)
+    if clock.get("port"):
+        cfg.set("global", "clock-port", clock["port"])
     for n in sorted(lfos or {}):
         entry = lfos[n]
         if not entry:
@@ -1066,6 +1103,16 @@ def save_project_file(path, bpm, out_port, tracks, lfos=None):
                 cfg.set(section, f"sustain-{n}", pdata["sustains"][n])
             for n in sorted(pdata.get("microtimes", {})):
                 cfg.set(section, f"microtime-{n}", pdata["microtimes"][n])
+            if pdata.get("osc-server"):
+                cfg.set(section, "osc-server", pdata["osc-server"])
+            if pdata.get("osc-sclang"):
+                cfg.set(section, "osc-sclang", pdata["osc-sclang"])
+            if pdata.get("osc-latency") is not None:
+                cfg.set(section, "osc-latency", str(pdata["osc-latency"]))
+            if pdata.get("synth"):
+                cfg.set(section, "synth", pdata["synth"])
+            for name in sorted(pdata.get("fx", {})):
+                cfg.set(section, f"fx-{name}", pdata["fx"][name])
             if pdata.get("sample"):
                 cfg.set(section, "sample", pdata["sample"])
             for n in sorted(pdata.get("orders", {})):
@@ -1073,6 +1120,7 @@ def save_project_file(path, bpm, out_port, tracks, lfos=None):
                         order_to_text(pdata["orders"][n]))
             if pdata.get("type") not in (None, "note"):
                 cfg.set(section, "type", pdata["type"])
+            if pdata.get("type") == "cc":
                 cfg.set(section, "controller", str(pdata.get("controller", 1)))
             division = pdata.get("division")
             if division is not None and division != DEFAULT_DIVISIONS:
@@ -1102,8 +1150,21 @@ def load_project_file(path):
 
     bpm = cfg.getint("global", "bpm", fallback=DEFAULT_BPM) if cfg.has_section("global") else DEFAULT_BPM
     port = None
-    if cfg.has_section("global") and cfg.has_option("global", "port"):
-        port = cfg.get("global", "port").strip() or None
+    clock = {"mode": midiclock.MODE_OFF, "port": None,
+             "start_mode": midiclock.START_INTERNAL}
+    if cfg.has_section("global"):
+        if cfg.has_option("global", "port"):
+            port = cfg.get("global", "port").strip() or None
+        if cfg.has_option("global", "clock-mode"):
+            mode = cfg.get("global", "clock-mode").strip().lower()
+            if mode in midiclock.MODES:
+                clock["mode"] = mode
+        if cfg.has_option("global", "clock-port"):
+            clock["port"] = cfg.get("global", "clock-port").strip() or None
+        if cfg.has_option("global", "clock-start"):
+            start_mode = cfg.get("global", "clock-start").strip().lower()
+            if start_mode in midiclock.START_MODES:
+                clock["start_mode"] = start_mode
 
     tracks = {}
     lfos = {}
@@ -1152,6 +1213,17 @@ def load_project_file(path):
                     pdata["division"] = parse_division(cfg.get(section, option))
                 elif option == "sample":
                     pdata["sample"] = cfg.get(section, option).strip()
+                elif option == "osc-server":
+                    pdata["osc-server"] = cfg.get(section, option).strip()
+                elif option == "osc-sclang":
+                    pdata["osc-sclang"] = cfg.get(section, option).strip()
+                elif option == "osc-latency":
+                    pdata["osc-latency"] = cfg.getfloat(section, option)
+                elif option == "synth":
+                    pdata["synth"] = cfg.get(section, option).strip()
+                elif option.startswith("fx-"):
+                    pdata.setdefault("fx", {})[option[3:]] = \
+                        cfg.get(section, option).strip()
                 elif option.startswith("order-"):
                     n = int(option[6:])
                     pdata.setdefault("orders", {})[n] = \
@@ -1179,7 +1251,7 @@ def load_project_file(path):
             entry["running"] = cfg.getboolean(section, "running", fallback=False)
             continue
         # ignore any other foreign section
-    return bpm, port, tracks, lfos
+    return bpm, port, tracks, lfos, clock
 
 
 def _load_lfo_param(raw):
@@ -1646,6 +1718,7 @@ class SeqShell(SeqCompletingCmd):
         self.project = {"tracks": {}, "lfos": {}}  # project state + global LFOs
         self.beat_epoch = time.monotonic()  # shared beat grid for LFO start
         self.playback = {}  # (track, pattern, phrase) -> player.Player
+        self._init_clock()  # MIDI clock send/receive facade
         initialize_readline()
 
     # ------------------------------------------------------------------
@@ -1735,6 +1808,184 @@ class SeqShell(SeqCompletingCmd):
                   f"shape {entry.get('shape', 'sin')}, "
                   f"phase {float(entry.get('phase', 0.0)):g}")
 
+    # ------------------------------------------------------------------
+    # MIDI clock (24 PPQN) send / receive
+    # ------------------------------------------------------------------
+    def _init_clock(self):
+        """Create the MIDI clock facade (called from __init__)."""
+        self.clock_mode = midiclock.MODE_OFF
+        self.clock_port = None
+        self.clock_start = midiclock.START_INTERNAL
+        self.midi_clock = midiclock.MidiClock(
+            bpm_getter=lambda: self.bpm,
+            playback_getter=lambda: bool(self.playback),
+            on_external_bpm=self._bpm_from_clock,
+            on_external_start=self.start_all_patterns,
+            on_external_stop=self._stop_all_playback)
+
+    def _bpm_from_clock(self, bpm):
+        """Follow a received MIDI clock: it sets the global BPM."""
+        self.bpm = max(BPM_MIN, min(BPM_MAX, int(round(bpm))))
+
+    def _apply_clock(self, announce=True):
+        """(Re)configure the clock from the stored settings."""
+        ok, message = self.midi_clock.configure(mode=self.clock_mode,
+                                               port=self.clock_port,
+                                               start_mode=self.clock_start)
+        if announce:
+            print(message if ok else f"Error: {message}")
+        return ok
+
+    def do_start_all(self, arg):
+        "Start every configured pattern (same as a received MIDI Start)"
+        self.start_all_patterns()
+
+    def start_all_patterns(self):
+        """Start every configured pattern (used by a received MIDI Start)."""
+        started, skipped = [], []
+        tracks = self.project.get("tracks", {})
+        for track in sorted(tracks):
+            for pattern in sorted(tracks[track]):
+                view = self._pattern_view(track, pattern)
+                kind = view["type"]
+                if kind == "loop":
+                    if view["phrases"]:
+                        self.launch_loop(track, pattern,
+                                         phrase=min(view["phrases"]))
+                    elif view["orders"]:
+                        self.launch_loop(track, pattern,
+                                         order_index=min(view["orders"]))
+                    else:
+                        skipped.append(f"t{track}p{pattern}")
+                        continue
+                elif view["phrases"]:
+                    self.launch_phrase(track, pattern, min(view["phrases"]))
+                else:
+                    skipped.append(f"t{track}p{pattern}")
+                    continue
+                started.append(f"t{track}p{pattern}")
+        if started:
+            print(f"Clock start: started {len(started)} pattern(s): "
+                  f"{', '.join(started)}")
+        else:
+            print("Clock start: nothing to start (no pattern has a phrase).")
+        if skipped:
+            print(f"  (no phrase configured in: {', '.join(skipped)})")
+        return len(started)
+
+    def do_clock(self, arg):
+        """MIDI clock: clock [send|receive|off|port <name>|start internal|received]"""
+        parts = (arg or "").split()
+        head = parts[0].lower() if parts else ""
+        rest = " ".join(parts[1:]).strip()
+
+        if not head:
+            for line in self.midi_clock.status_lines():
+                print(line)
+            inputs = midiclock.input_port_names()
+            outputs = midiclock.output_port_names()
+            print(f"  input ports:  {', '.join(inputs) if inputs else '(none)'}")
+            print(f"  output ports: {', '.join(outputs) if outputs else '(none)'}")
+            print("  Usage: clock send|receive|off, clock port <name|index>, "
+                  "clock start internal|received")
+            return
+
+        if head in ("off", "none", "stop"):
+            self.clock_mode = midiclock.MODE_OFF
+            self.midi_clock.mode = midiclock.MODE_OFF
+            self.midi_clock.stop()
+            print("MIDI clock off.")
+            return
+        if head in ("send", "out", "master"):
+            self.clock_mode = midiclock.MODE_SEND
+            names = midiclock.output_port_names()
+            if self.clock_port and self.clock_port not in names:
+                print(f"Error: '{self.clock_port}' is not an available MIDI "
+                      f"OUTPUT port.")
+                print(f"  Choose one: clock port out <name|index>   "
+                      f"({', '.join(names) if names else 'none found'})")
+                return
+            self._apply_clock()
+            return
+        if head in ("receive", "in", "slave", "follow"):
+            self.clock_mode = midiclock.MODE_RECEIVE
+            names = midiclock.input_port_names()
+            if self.clock_port and self.clock_port not in names:
+                print(f"Error: '{self.clock_port}' is not an available MIDI "
+                      f"INPUT port.")
+                print(f"  Choose one: clock port in <name|index>   "
+                      f"({', '.join(names) if names else 'none found'})")
+                return
+            self._apply_clock()
+            return
+        if head in ("start", "startmode", "start-mode"):
+            value = rest.lower()
+            if value not in midiclock.START_MODES:
+                print(f"Usage: clock start internal|received   "
+                      f"(currently {self.clock_start})")
+                print("  internal: our 'start'/'stop' commands control playback")
+                print("  received: a MIDI Start from the clock source starts "
+                      "every configured pattern")
+                return
+            self.clock_start = value
+            self.midi_clock.start_mode = value
+            print(f"clock start: {value}"
+                  + ("  (MIDI Start starts all configured patterns)"
+                     if value == midiclock.START_RECEIVED else ""))
+            return
+        if head in ("port", "device"):
+            if not rest:
+                print(f"clock port: {self.clock_port or '(none)'}")
+                print(f"  Usage: clock port [in|out] <name|index>   "
+                      f"(with no direction: "
+                      f"{'in' if self.clock_mode == midiclock.MODE_RECEIVE else 'out'})")
+                outputs = midiclock.output_port_names()
+                inputs = midiclock.input_port_names()
+                print(f"  output ports (clock send): "
+                      f"{', '.join(f'{i}: {n}' for i, n in enumerate(outputs)) or '(none)'}")
+                print(f"  input ports  (clock receive): "
+                      f"{', '.join(f'{i}: {n}' for i, n in enumerate(inputs)) or '(none)'}")
+                return
+            text = rest
+            direction = None
+            for word in ("in", "out"):
+                if text.lower().startswith(word + " "):
+                    direction = word
+                    text = text[len(word):].strip()
+                    break
+            if direction is None:
+                direction = ("in" if self.clock_mode == midiclock.MODE_RECEIVE
+                             else "out")
+            names = (midiclock.input_port_names() if direction == "in"
+                     else midiclock.output_port_names())
+            kind = ("MIDI input" if direction == "in" else "MIDI output")
+            if text.isdigit():
+                index = int(text)
+                if not names:
+                    print(f"Error: no {kind} ports are enumerated right now "
+                          f"(MIDI devices can come and go); nothing changed.")
+                    return
+                if index >= len(names):
+                    print(f"Error: there is no {kind} port {index} - choose "
+                          f"0..{len(names) - 1}:")
+                    for i, name in enumerate(names):
+                        print(f"    {i}: {name}")
+                    return
+                self.clock_port = names[index]
+            else:
+                self.clock_port = text
+                if names and text not in names:
+                    print(f"Note: '{text}' is not in the current {kind} list "
+                          f"({', '.join(names)}).")
+            print(f"clock port: {self.clock_port} ({kind})")
+            if self.clock_mode == midiclock.MODE_OFF:
+                print("  (clock is off; use 'clock send' or 'clock receive')")
+                return
+            self._apply_clock()
+            return
+        print(f"Error: unknown clock option '{head}'. Use send, receive, off, "
+              f"port <name> or start internal|received.")
+
     def do_bpm(self, arg):
         "Show or set the global BPM (default: 120, 1-300). Patterns inherit it"
         if not (arg or "").strip():
@@ -1750,9 +2001,11 @@ class SeqShell(SeqCompletingCmd):
         "Save the whole configuration to a .cfg file (default: seq.cfg)"
         filename = (arg or "").strip() or "seq.cfg"
         try:
-            written = save_project_file(filename, self.bpm, self.out_port,
-                                        self.project["tracks"],
-                                        self.project.get("lfos"))
+            written = save_project_file(
+                filename, self.bpm, self.out_port, self.project["tracks"],
+                self.project.get("lfos"),
+                clock={"mode": self.clock_mode, "port": self.clock_port,
+                       "start_mode": self.clock_start})
         except OSError as e:
             print(f"Error writing {filename}: {e}")
             return
@@ -1763,7 +2016,7 @@ class SeqShell(SeqCompletingCmd):
         "Load the whole configuration from a .cfg file (default: seq.cfg)"
         filename = (arg or "").strip() or "seq.cfg"
         try:
-            bpm, port, tracks, lfos = load_project_file(filename)
+            bpm, port, tracks, lfos, clock = load_project_file(filename)
         except OSError as e:
             print(f"Error reading {filename}: {e}")
             return
@@ -1773,6 +2026,11 @@ class SeqShell(SeqCompletingCmd):
         self.bpm = bpm
         self.out_port = port
         self.project = {"tracks": tracks, "lfos": lfos}
+        if isinstance(clock, dict):
+            self.clock_mode = clock.get("mode", midiclock.MODE_OFF)
+            self.clock_port = clock.get("port")
+            self.clock_start = clock.get("start_mode",
+                                         midiclock.START_INTERNAL)
         for entry in lfos.values():
             if entry.get("running"):
                 entry[LFO_START_KEY] = self.next_beat_time(bpm)
@@ -1805,6 +2063,11 @@ class SeqShell(SeqCompletingCmd):
             "phrases": entry.get("phrases", {}),
             "velocities": entry.get("velocities", {}),
             "sustains": entry.get("sustains", {}),
+            "osc_server": entry.get("osc-server"),
+            "osc_sclang": entry.get("osc-sclang"),
+            "osc_latency": entry.get("osc-latency"),
+            "synth": entry.get("synth"),
+            "fx": entry.get("fx", {}),
             "sample": entry.get("sample"),
             "orders": entry.get("orders", {}),
         }
@@ -1817,7 +2080,8 @@ class SeqShell(SeqCompletingCmd):
         at the start of the next division cycle while playing.
         """
         view0 = self._pattern_view(track, pattern)
-        if not view0["port"]:
+        is_osc = view0["type"] == "osc"
+        if not is_osc and not view0["port"]:
             print("No MIDI output port selected. Use 'select-port' (seq or pattern level).")
             return None
         self.stop_pattern(track, pattern, announce=False)
@@ -1857,8 +2121,13 @@ class SeqShell(SeqCompletingCmd):
                 return fold_midi(root_midi + 12 * (octave + shift)
                                  + intervals[pos])
 
+            osc = None
+            if view["type"] == "osc":
+                osc = {"synth": view["synth"], "fx": dict(view["fx"]),
+                       "lfos": self.project.get("lfos", {}),
+                       "bpm": view["bpm"], "latency": view["osc_latency"]}
             return (plan, infinite, step_time, resolver, view["channel"],
-                    view["type"], view["controller"])
+                    view["type"], view["controller"], osc)
 
         def velocity_for(seq_index, now):
             """Per-note velocity from the sequence's velocity expression."""
@@ -1900,10 +2169,31 @@ class SeqShell(SeqCompletingCmd):
                 return player.SUSTAIN_FRACTION
 
         try:
-            plan, infinite, step_time, resolver, channel, mode, controller = build()
+            (plan, infinite, step_time, resolver, channel, mode, controller,
+             osc) = build()
         except (phrases.PhraseError, LookupError, ValueError) as e:
             print(f"Error: {e}")
             return None
+
+        emitter = None
+        engine = None
+        if is_osc:
+            try:
+                server = (supercollider.parse_target(
+                    view0["osc_server"], supercollider.DEFAULT_SERVER_PORT)
+                    if view0["osc_server"] else supercollider.server_target())
+                sclang = (supercollider.parse_target(
+                    view0["osc_sclang"], supercollider.DEFAULT_SCLANG_PORT)
+                    if view0["osc_sclang"] else supercollider.sclang_target())
+            except ValueError as e:
+                print(f"Error: {e}")
+                return None
+            engine = supercollider.engine_for(server, sclang)
+            emitter = supercollider.OscEmitter(
+                engine, synth=(osc or {}).get("synth"),
+                fx=(osc or {}).get("fx"), lfos=(osc or {}).get("lfos"),
+                bpm=(osc or {}).get("bpm", view0["bpm"]),
+                latency=(osc or {}).get("latency"))
 
         try:
             pl = player.Player(view0["port"], channel, step_time, plan, infinite,
@@ -1911,12 +2201,24 @@ class SeqShell(SeqCompletingCmd):
                                velocity_resolver=velocity_for,
                                sustain_resolver=sustain_for,
                                microtime_resolver=microtime_for,
-                               mode=mode, controller=controller)
+                               mode=mode, controller=controller,
+                               emitter=emitter, owns_port=not is_osc)
         except (ValueError, OSError) as e:
             print(f"Error starting playback: {e}")
             return None
         self.playback[(track, pattern, phrase)] = pl
         kind = "infinite loop" if infinite else f"one pass ({len(plan)} steps)"
+        if is_osc:
+            target = (f"{engine.target_text} synth '{emitter.synth}'"
+                      if engine else "SuperCollider")
+            fx_text = (" fx " + ", ".join(f"{k}={v}" for k, v
+                                          in sorted((osc or {}).get("fx", {}).items()))
+                       if (osc or {}).get("fx") else "")
+            print(f"Playing phrase {phrase} of pattern {pattern}, track {track} "
+                  f"({view0['phrases'][phrase]}) -> OSC {target}{fx_text}, "
+                  f"{view0['bpm']} BPM ({kind}, step {step_time * 1000:.1f} ms). "
+                  f"Type 'stop' to end.")
+            return pl
         what = (f"CC{controller}" if mode == "cc" else "notes")
         print(f"Playing phrase {phrase} of pattern {pattern}, track {track} "
               f"({self._pattern_view(track, pattern)['phrases'][phrase]}) -> "
@@ -1958,10 +2260,11 @@ class SeqShell(SeqCompletingCmd):
             view = self._pattern_view(track, pattern)
             sample = sampler.load_sample(path)
             if phrase is None:
-                order = list((view["orders"] or {}).get(order_index) or [])
-                if not order:
+                entries = list((view["orders"] or {}).get(order_index) or [])
+                if not entries:
                     raise LookupError(f"order list o{order_index} of pattern "
                                       f"{pattern} is not configured")
+                steps = [(order_index, entry) for entry in entries]
                 label = f"o{order_index}"
             else:
                 expr = (view["phrases"] or {}).get(phrase)
@@ -1971,34 +2274,54 @@ class SeqShell(SeqCompletingCmd):
                 plan, _infinite = player.flatten_phrase(
                     expr, lambda kind, idx: (view["orders"] or {}).get(idx)
                     if kind == "order" else None)
-                order = [entry for _index, entry in plan]
-                if not order:
+                steps = list(plan)
+                if not steps:
                     raise LookupError(f"phrase f{phrase} yields no steps")
                 label = f"f{phrase} ({expr})"
             step_time = player.step_time_for(view["bpm"], view["division"])
             label = (f"{label} of pattern {pattern}, track {track} "
                      f"('{view['sample']}', {sample.duration_text()})")
-            return sample, order, step_time, label
+            order = [entry for _index, entry in steps]
+            return sample, steps, order, step_time, label
 
-        def live_order(items, bpm):
-            """Wrap expression entries so they resolve at every step."""
+        def live_order(steps, bpm):
+            """Resolve positions and velocities at every step.
+
+            Each item becomes (position, velocity) - or a callable returning it -
+            so an LFO moves the position while v<k> scales the volume, exactly
+            like velocity works for a note pattern's s<k>.
+            """
             lfos = self.project.get("lfos", {})
+            view = self._pattern_view(track, pattern)
+            velocities = view.get("velocities") or {}
             out = []
-            for item in items:
-                if isinstance(item, str):
-                    out.append(lambda now, e=item: order_entry_value(
-                        e, lfos, bpm, now))
+            for index, entry in steps:
+                vexpr = velocities.get(index)
+
+                def value(now, e=entry, v=vexpr):
+                    position = order_entry_value(e, lfos, bpm, now)
+                    if position is None:
+                        return None
+                    if not v:
+                        return position
+                    try:
+                        return (position, velocity.evaluate(v, lfos, bpm, now))
+                    except ValueError:
+                        return position
+
+                if isinstance(entry, str) or vexpr:
+                    out.append(value)
                 else:
-                    out.append(item)
+                    out.append(entry)
             return out
 
         def prepare(spec):
             """-> ((sample, live order, step_time, label), printable text)."""
-            sample, order, step_time, label = spec
+            sample, steps, order, step_time, label = spec
             view = self._pattern_view(track, pattern)
             text = order_to_text(order)
-            return ((sample, live_order(order, view["bpm"]), step_time, label),
-                    text)
+            return ((sample, steps, live_order(steps, view["bpm"]),
+                     step_time, label), text)
 
         try:
             spec, order_text = prepare(build())
@@ -2006,18 +2329,29 @@ class SeqShell(SeqCompletingCmd):
             print(f"Error: {e}")
             return None
         self.stop_pattern(track, pattern, announce=False)
-        sample, order, step_time, label = spec
+        sample, _steps, order, step_time, label = spec
         key = ((track, pattern, phrase) if phrase is not None
                else (track, pattern, "o", order_index))
-        pl = sampler.LoopPlayer(lambda: prepare(build())[0], key=key)
+        def player_spec():
+            """What the LoopPlayer needs: sample, live order, step, label."""
+            sample, _steps, order, step_time, label = prepare(build())[0]
+            return sample, order, step_time, label
+
+        pl = sampler.LoopPlayer(player_spec, key=key)
         self.playback[key] = pl
         pl.start()
         what = f"f{phrase}" if phrase is not None else f"o{order_index}"
         bars = bars_text(len(order), view["division"])
         bars_txt = f" = {bars}" if bars else ""
+        vel_text = ""
+        used = sorted({index for index, _entry in _steps})
+        ves = (view.get("velocities") or {})
+        if any(ves.get(i) for i in used):
+            shown = ", ".join(f"v{i}={ves[i]}" for i in used if ves.get(i))
+            vel_text = f", velocity {shown}"
         print(f"Playing {label}: {len(order)} steps "
               f"({order_text}) = positions in the sample, {view['bpm']} BPM, "
-              f"step {step_time * 1000:.1f} ms{bars_txt}, looped. "
+              f"step {step_time * 1000:.1f} ms{vel_text}{bars_txt}, looped. "
               f"Type 'stop {what}' to end.")
         return pl
 
@@ -2137,14 +2471,24 @@ class SeqShell(SeqCompletingCmd):
                 and not microtimes and not orders and not sample:
             return None
         port_text = f"{view['port']}" if view["port"] else "(none selected)"
-        what = ("type note" if view["type"] not in ("cc", "loop")
+        what = ("type note" if view["type"] not in ("cc", "loop", "osc")
                 else f"type CC{view['controller']}" if view["type"] == "cc"
+                else "type osc" if view["type"] == "osc"
                 else "type loop")
         block = [f"  Pattern {pattern}: {what}, scale {view['scale']}, root "
                  f"{view['root'].name()}, channel {view['channel']}, "
                  f"bpm {view['bpm']}, "
                  f"division {division_to_text(view['division'])}, "
                  f"port {port_text}"]
+        if view["type"] == "osc":
+            server = view["osc_server"] or (
+                f"{supercollider.DEFAULT_HOST}:"
+                f"{supercollider.DEFAULT_SERVER_PORT} (default)")
+            fx = (", ".join(f"{k}={v}" for k, v in sorted(view["fx"].items()))
+                  if view["fx"] else "no fx parameters")
+            block.append(f"    osc: {server}, synth "
+                         f"'{view['synth'] or supercollider.DEFAULT_SYNTH}', "
+                         f"fx {fx}")
         if is_loop:
             step_ms = division_step_ms(view["bpm"], view["division"])
             seconds = (sampler.sample_seconds(
@@ -2221,6 +2565,20 @@ class SeqShell(SeqCompletingCmd):
                 print("       show t<n>p<m>s<k>|f<k>|v<k>|sus<k>|mt<k>|o<k>  (one leaf)")
                 return
 
+        # Global settings first (BPM, output port, MIDI clock)
+        global_line = f"Global: bpm {self.bpm}"
+        if self.out_port:
+            global_line += f", port {self.out_port}"
+        if self.clock_mode != midiclock.MODE_OFF:
+            global_line += f", clock {self.clock_mode}"
+            if self.clock_port:
+                global_line += f" on {self.clock_port}"
+            if (self.clock_mode == midiclock.MODE_RECEIVE
+                    and self.clock_start == midiclock.START_RECEIVED):
+                global_line += " (start received)"
+        if self.clock_mode != midiclock.MODE_OFF:
+            print(global_line)
+
         running = set()
         running_orders = set()
         for key, pl in self.playback.items():
@@ -2262,6 +2620,10 @@ class SeqShell(SeqCompletingCmd):
             view = self._pattern_view(track, pattern)
             if view["type"] == "cc":
                 desc = f"type CC{view['controller']}, values 0-127"
+            elif view["type"] == "osc":
+                desc = (f"type osc, synth "
+                        f"'{view['synth'] or supercollider.DEFAULT_SYNTH}' "
+                        f"-> {view['osc_server'] or 'default server'}")
             elif view["type"] == "loop":
                 length = (sampler.sample_seconds(
                     sampler.resolve_sample(view["sample"])[0])
@@ -2385,6 +2747,8 @@ class SeqShell(SeqCompletingCmd):
             return super().do_help(arg.strip().replace("-", "_"))
         print("\nAvailable Commands:")
         print(f"  {'list-ports':<20} - list available MIDI input and output ports")
+        print(f"  {'clock [...]':<20} - MIDI clock 24 PPQN: clock send|receive|off, clock port <name>, clock start internal|received")
+        print(f"  {'start-all':<20} - start every configured pattern (what a received MIDI Start does)")
         print(f"  {'select-port':<20} - choose the MIDI output port for playback")
         print(f"  {'bpm [<value>]':<20} - show or set the global BPM (default 120)")
         print(f"  {'t<n>':<20} - enter a track menu (n = 1-16)")
@@ -2423,6 +2787,21 @@ class SeqShell(SeqCompletingCmd):
               "  s=sequence, f=phrase, o=order.")
         print()
 
+    def free_supercollider(self, announce=False):
+        """Free every playing node on the SuperCollider servers in use."""
+        engines = list(supercollider._engines.values())
+        freed = 0
+        for engine in engines:
+            if engine.free_all():
+                freed += 1
+        if announce:
+            if freed:
+                print(f"Sent /g_freeAll to {freed} SuperCollider "
+                      f"server(s).")
+            else:
+                print("No SuperCollider server was reachable.")
+        return freed
+
     def _stop_all_playback(self):
         """Stop every running player (phrases, loops) - exit and panic."""
         for key, pl in list(self.playback.items()):
@@ -2434,22 +2813,84 @@ class SeqShell(SeqCompletingCmd):
         sampler.stop_audio()
 
     def panic(self):
-        """Stop all phrases and send MIDI All Sound Off / All Notes Off."""
+        """Stop phrases/loops, silence MIDI and free SuperCollider nodes."""
         ports = {self.out_port} if self.out_port else set()
         ports.update(pl.port_name for pl in self.playback.values())
         count = len(self.playback)
+        had_osc = bool(supercollider._engines)
         self._stop_all_playback()
         sent = player.panic_ports(ports)
-        if count or sent:
-            print(f"Panic: stopped {count} playback{'s' if count != 1 else ''} "
-                  f"(phrases/loops, audio silenced); sent All Sound Off on "
-                  f"{len(sent)} port{'s' if len(sent) != 1 else ''}.")
+        sc = self.free_supercollider() if had_osc else 0
+        if count or sent or sc:
+            extra = (f"; sent All Sound Off on "
+                     f"{len(sent)} port{'s' if len(sent) != 1 else ''}" if sent
+                     else "")
+            if sc:
+                extra += f"; freed SuperCollider nodes on {sc} server(s)"
+            print(f"Panic: stopped {count} playback{'s' if count != 1 else ''}"
+                  f"{extra}.")
         else:
             print("Panic: nothing playing.")
 
     def do_panic(self, arg):
         "Stop everything (phrases, loops) and silence MIDI/audio outputs"
         self.panic()
+
+    def do_status(self, arg):
+        "Ask a SuperCollider server for /status (default: 127.0.0.1:57110)"
+        targets = [engine.target_text
+                   for engine in supercollider._engines.values()]
+        target = (arg or "").strip() or (
+            targets[0] if targets else supercollider.DEFAULT_HOST + ":"
+            + str(supercollider.DEFAULT_SERVER_PORT))
+        try:
+            server = supercollider.parse_target(
+                target, supercollider.DEFAULT_SERVER_PORT)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        engine = supercollider.engine_for(server, None)
+        print(f"Pinging {engine.target_text} ...")
+        info = engine.status(timeout=1.5)
+        if not info:
+            print("  No /status.reply: no SuperCollider server is listening "
+                  "there (start scsynth / 's.boot', or name one: "
+                  "'status <host>:<port>').")
+            return
+        print(f"  Synths {info['synths']}, groups {info['groups']}, "
+              f"SynthDefs {info['synthdefs']}, UGens {info['ugens']}, "
+              f"CPU {info['avg_cpu']:.1f}%, SR {info['sample_rate']:.0f} Hz")
+        if arg and targets:
+            print(f"  (patterns use: {', '.join(targets)})")
+
+    def do_dump(self, arg):
+        "Record/show the OSC traffic of the pattern(s): dump [on|off|clear]"
+        if not supercollider._engines:
+            print("No OSC traffic yet (use 'type osc' in a pattern and play it).")
+            return
+        text = (arg or "").strip().lower()
+        engines = list(supercollider._engines.values())
+        if text in ("on", "start"):
+            for engine in engines:
+                engine.recording = True
+            print(f"OSC recording on for {len(engines)} target(s).")
+            return
+        if text in ("off", "stop"):
+            for engine in engines:
+                engine.recording = False
+            print("OSC recording off.")
+            return
+        if text in ("clear", "reset"):
+            for engine in engines:
+                engine.log = []
+            print("OSC log cleared.")
+            return
+        for engine in engines:
+            state = "on" if engine.recording else "off"
+            print(f"{engine.target_text}: recording {state}, "
+                  f"{engine.sent_notes} notes sent")
+            for line in engine.log[-8:]:
+                print(f"    {line}")
 
     def do_cp(self, arg):
         "Copy a track, pattern, leaf or LFO: cp <source> <destination>"
@@ -2741,11 +3182,14 @@ class SeqShell(SeqCompletingCmd):
                     "bpm": ["bpm", "bpm-inherited"], "division": ["division"],
                     "type": ["type", "controller"], "controller": ["controller"],
                     "port": ["port"], "select-port": ["port"],
-                    "sample": ["sample"]}
+                    "sample": ["sample"],
+                    "osc": ["osc-server", "osc-sclang", "osc-latency"],
+                    "synth": ["synth"],
+                    "fx": ["fx"]}
             if verb not in keys:
                 print(f"Error: unknown setting '{verb}'. Use scale, root, bpm, "
-                      f"channel, division, type, controller, sample "
-                      f"or port.")
+                      f"channel, division, type, controller, sample, "
+                      f"osc, synth, fx or port.")
                 return
             if not entry:
                 print(f"Error: pattern t{track}p{pattern} is not configured.")
@@ -2760,7 +3204,10 @@ class SeqShell(SeqCompletingCmd):
                         "type": "note", "controller": "1",
                         "port": "inherits the global port",
                         "select-port": "inherits the global port",
-                        "sample": "no sample"}
+                        "sample": "no sample",
+                        "osc": "the default 127.0.0.1:57110",
+                        "synth": f"the default '{supercollider.DEFAULT_SYNTH}'",
+                        "fx": "no effect parameters"}
             print(f"Reset {verb} of t{track}p{pattern} ({defaults[verb]}).")
             return
 
@@ -2824,12 +3271,20 @@ class SeqShell(SeqCompletingCmd):
 
     def do_exit(self, arg):
         "Exit the shell"
+        self.midi_clock.shutdown()
         self._stop_all_playback()
+        if supercollider._engines:
+            self.free_supercollider()
+        supercollider.close_all()
         print("Goodbye!")
         return True
 
     def do_EOF(self, arg):
+        self.midi_clock.shutdown()
         self._stop_all_playback()
+        if supercollider._engines:
+            self.free_supercollider()
+        supercollider.close_all()
         print()
         return True
 
@@ -3628,6 +4083,11 @@ class PatternShell(SeqCompletingCmd):
         self.velocities = {}  # seq index (0-9) -> velocity expression text
         self.sustains = {}  # seq index (0-9) -> sustain expression text
         self.microtimes = {}  # seq index (0-9) -> microtiming expression text
+        self.osc_server = None   # osc pattern: 'host:port' of scsynth
+        self.osc_sclang = None   # osc pattern: 'host:port' of sclang
+        self.osc_latency = None  # osc pattern: scheduling latency in seconds
+        self.synth = None        # osc pattern: SynthDef name
+        self.fx = {}             # osc pattern: fx name -> expression
         self.sample = None   # loop pattern: .wav file name inside samples/
         self.orders = {}     # loop pattern: o index (0-9) -> [position|expr|None]
         self.pattern_type = "note"  # "note", "cc" or "loop"
@@ -3670,6 +4130,11 @@ class PatternShell(SeqCompletingCmd):
         self.pattern_type = str(entry.get("type", "note")).lower()
         self.controller = int(entry.get("controller", 1))
         self.division = entry.get("division", DEFAULT_DIVISIONS)
+        self.osc_server = entry.get("osc-server")
+        self.osc_sclang = entry.get("osc-sclang")
+        self.osc_latency = entry.get("osc-latency")
+        self.synth = entry.get("synth")
+        self.fx = dict(entry.get("fx", {}))
         self.sample = entry.get("sample")
         self.orders = dict(entry.get("orders", {}))
 
@@ -3692,6 +4157,11 @@ class PatternShell(SeqCompletingCmd):
             "type": self.pattern_type,
             "controller": self.controller,
             "division": self.division,
+            "osc-server": self.osc_server,
+            "osc-sclang": self.osc_sclang,
+            "osc-latency": self.osc_latency,
+            "synth": self.synth,
+            "fx": dict(self.fx),
             "sample": self.sample,
             "orders": dict(self.orders),
         })
@@ -4143,8 +4613,346 @@ class PatternShell(SeqCompletingCmd):
         if announce:
             print("Histogram live view stopped.")
 
+
+
+    # ----------------------------------------------------------------- osc --
+    def _osc_engine(self):
+        """SoundEngine for this pattern's targets (created on demand)."""
+        server = (supercollider.parse_target(
+            self.osc_server, supercollider.DEFAULT_SERVER_PORT)
+            if self.osc_server else supercollider.server_target())
+        sclang = (supercollider.parse_target(
+            self.osc_sclang, supercollider.DEFAULT_SCLANG_PORT)
+            if self.osc_sclang else supercollider.sclang_target())
+        return supercollider.engine_for(server, sclang)
+
+    def _fx_text(self):
+        if not self.fx:
+            return "no fx parameters"
+        return ", ".join(f"{k}={v}" for k, v in sorted(self.fx.items()))
+
+    def do_osc(self, arg):
+        "Show or set the SuperCollider server target of an osc pattern"
+        text = (arg or "").strip()
+        if not text:
+            engine = self._osc_engine()
+            print(f"OSC: {'signal to ' + engine.target_text if self.osc_server else 'default target'}"
+                  f"{' (default 127.0.0.1:57110)' if not self.osc_server else ''}")
+            print(f"  synthdefs to sclang at "
+                  f"{self.osc_sclang or '127.0.0.1:57120 (default)'}")
+            print(f"  synth '{self.synth or supercollider.DEFAULT_SYNTH}'"
+                  f"   fx {self._fx_text()}")
+            if self.pattern_type != "osc":
+                print(f"  (this pattern is type '{self.pattern_type}'; "
+                      f"'type osc' makes it send SuperCollider notes)")
+            print("  Usage: osc [<host>:<port>]   e.g. osc 127.0.0.1:57110")
+            return
+        try:
+            host, port = supercollider.parse_target(
+                text, supercollider.DEFAULT_SERVER_PORT)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        self.osc_server = f"{host}:{port}"
+        self._commit()
+        print(f"OSC target set to {self.osc_server} (scsynth). Notes go there "
+              f"with 'synth {self.synth or supercollider.DEFAULT_SYNTH}'.")
+
+    def do_sclang(self, arg):
+        "Show or set the sclang target used to install SynthDefs"
+        text = (arg or "").strip()
+        if not text:
+            print(f"sclang: {self.osc_sclang or '127.0.0.1:57120 (default)'}"
+                  f"   (responder '/seqd' from {supercollider.HELPER_FILE})")
+            print("  Usage: sclang [<host>:<port>]")
+            return
+        try:
+            host, port = supercollider.parse_target(
+                text, supercollider.DEFAULT_SCLANG_PORT)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        self.osc_sclang = f"{host}:{port}"
+        self._commit()
+        print(f"sclang target set to {self.osc_sclang} (SynthDefs via /seqd).")
+
+    def do_synth(self, arg):
+        "Show or set the SynthDef name an osc pattern plays"
+        text = (arg or "").strip()
+        if not text:
+            current = self.synth or supercollider.DEFAULT_SYNTH
+            described = supercollider.catalogue_description(current)
+            print(f"synth: {current}"
+                  f"{('   (' + described + ')') if described else ''}")
+            print(f"  Usage: synth <name>   e.g. synth bass, synth bell")
+            print(f"  Built-in: {', '.join(supercollider.catalogue_names())}")
+            print(f"  Install them with 'synthdef all', list with 'synthdef'.")
+            for line in self._available_params():
+                print(line)
+            return
+        try:
+            name = supercollider.safe_name(text)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        self.synth = name
+        self._commit()
+        described = supercollider.catalogue_description(name)
+        extra = f"   ({described})" if described else ""
+        print(f"synth set to '{name}'{extra} (per-note /s_new on "
+              f"{self._osc_engine().target_text})")
+        known = supercollider.list_synthdefs()
+        if not described and name not in known:
+            print(f"  Note: nothing local defines '{name}'. Install it with "
+                  f"'synthdef all' or 'synthdef {name}', or make sure it is "
+                  f"already loaded in SuperCollider.")
+
+    def _synthdef_listing(self):
+        """Show the built-in catalogue and the files in synthdefs/."""
+        files = set(supercollider.list_synthdefs())
+        print(f"Built-in SynthDefs (send them all with 'synthdef all'):")
+        for name in supercollider.catalogue_names():
+            mark = "*" if name in files else " "
+            print(f"  {mark} {name:<7} {supercollider.catalogue_description(name)}")
+        extra = sorted(files - set(supercollider.catalogue_names()))
+        if extra:
+            print(f"  Your files: {', '.join(extra)}")
+        print(f"  (* = written in {supercollider.SYNTHDEF_DIR}; "
+              f"'synth <name>' picks one per pattern)")
+        print(f"  Run {supercollider.HELPER_FILE} once in SuperCollider so the "
+              f"/seqd responder exists.")
+
+    def _send_all_synthdefs(self):
+        """Write the whole catalogue and install it with one /seqd message."""
+        engine = self._osc_engine()
+        path, count, err = engine.send_all_synthdefs()
+        if err:
+            print(f"Error: {err}")
+            print(f"  Everything is written in {supercollider.SYNTHDEF_DIR}; "
+                  f"run {supercollider.HELPER_FILE} in SuperCollider and "
+                  f"send it again.")
+            return
+        print(f"Sent {count} SynthDefs to sclang at {engine.sclang_text} as one "
+              f"file:")
+        print(f"  {path}")
+        print(f"  Choose one per pattern with 'synth <name>' (currently "
+              f"'{self.synth or supercollider.DEFAULT_SYNTH}').")
+
+    def do_synthdef(self, arg):
+        """Install SynthDefs: 'synthdef all' (one shot) or 'synthdef <name> [file]'"""
+        parts = (arg or "").split()
+        if not parts:
+            self._synthdef_listing()
+            return
+        if parts[0].lower() in ("all", "*", "everything"):
+            self._send_all_synthdefs()
+            return
+        try:
+            name = supercollider.safe_name(parts[0])
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        source = None
+        if len(parts) > 1:
+            candidate = parts[1]
+            path = candidate if os.path.isabs(candidate) else os.path.join(
+                supercollider.SYNTHDEF_DIR, candidate)
+            if not os.path.isfile(path):
+                print(f"Error: '{candidate}' not found "
+                      f"(looked in {supercollider.SYNTHDEF_DIR}).")
+                return
+            with open(path, encoding="utf-8") as handle:
+                source = handle.read()
+        engine = self._osc_engine()
+        path, err = engine.send_synthdef(name, source)
+        if err:
+            print(f"Error: {err}")
+            print(f"  The file was written to {path}; run "
+                  f"{supercollider.HELPER_FILE} in SuperCollider first.")
+            return
+        described = supercollider.catalogue_description(name)
+        print(f"SynthDef '{name}' sent to sclang at {engine.sclang_text} "
+              f"({path}).")
+        if described:
+            print(f"  {described}")
+        if not self.synth:
+            self.synth = name
+            self._commit()
+            print(f"  This pattern now plays 'synth {name}'.")
+
+    def do_latency(self, arg):
+        "Show or set the OSC scheduling latency in seconds (default 0.2)"
+        text = (arg or "").strip()
+        current = (self.osc_latency if self.osc_latency is not None
+                   else supercollider.DEFAULT_LATENCY)
+        if not text:
+            print(f"latency: {current:g} s "
+                  f"({'set' if self.osc_latency is not None else 'default'})")
+            print(f"  Bundles are scheduled this far in the future; scsynth "
+                  f"prints 'late <t>' when one arrives too late.")
+            print(f"  Raise it if you see 'late' messages, lower it for tighter "
+                  f"timing (e.g. latency 0.2 or latency 0.1).")
+            return
+        try:
+            value = float(text)
+        except ValueError:
+            print(f"Error: '{text}' is not a number of seconds.")
+            return
+        if not supercollider.MIN_LATENCY <= value <= supercollider.MAX_LATENCY:
+            print(f"Error: latency must be between "
+                  f"{supercollider.MIN_LATENCY:g} and "
+                  f"{supercollider.MAX_LATENCY:g} seconds.")
+            return
+        self.osc_latency = value
+        self._commit()
+        print(f"latency set to {value:g} s "
+              f"(applies at the next cycle of any playing osc pattern)")
+
+    def _available_params(self):
+        """Which controls can be sent to this pattern's SynthDef, as text."""
+        synth = self.synth or supercollider.DEFAULT_SYNTH
+        shared, extras = scdefs.controls(synth)
+        lines = [f"  {synth} accepts (set them with 'fx <name> <value|expr>'):",
+                 f"    note-driven  midinote freq amp dur    "
+                 f"(amp from v<k>, dur from sus<k>)",
+                 f"    every synth  {' '.join(shared)}"]
+        if extras:
+            lines.append(f"    {synth} only   {' '.join(extras)}")
+        known = [p for p in shared + extras if p in supercollider.FX_RANGES]
+        if known:
+            ranges = ", ".join(f"{p} {supercollider.fx_range(p)[0]:g}.."
+                               f"{supercollider.fx_range(p)[1]:g}" for p in known)
+            lines.append(f"    clamped      {ranges}")
+        if not extras:
+            lines.append("    (a SynthDef you write yourself can declare any "
+                         "extra control and it will be sent as-is)")
+        d = supercollider.catalogue_description(synth)
+        if not d:
+            lines.append(f"    note: '{synth}' is not a built-in name, so the "
+                         f"list above is just the common set")
+        return lines
+
+    def do_fx(self, arg):
+        "List, set or clear the per-note effect parameters of an osc pattern"
+        text = (arg or "").strip()
+        if not text:
+            if self.fx:
+                print(f"FX parameters of pattern {self.pattern_number} "
+                      f"({self.bpm} BPM):")
+                lfos = self._root_shell().project.get("lfos", {})
+                for name in sorted(self.fx):
+                    low, high = supercollider.fx_range(name)
+                    try:
+                        now = velocity.evaluate_span(self.fx[name], lfos,
+                                                     self.bpm,
+                                                     time.monotonic(), low, high)
+                    except ValueError:
+                        now = "?"
+                    print(f"  {name}: {self.fx[name]}   "
+                          f"(now {now}, range {low:g}..{high:g})")
+            else:
+                print("No fx parameters configured.")
+            print("  Usage: fx <name> <value|expr>   e.g. fx cutoff 2000+1500*lfo1")
+            print("         rm t1p1 fx cutoff        (clear one)")
+            for line in self._available_params():
+                print(line)
+            return
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1:
+            name = parts[0]
+            if name in self.fx:
+                print(f"{name}: {self.fx[name]}")
+            else:
+                print(f"{name}: not configured. Usage: fx {name} <value|expr>")
+            return
+        name, expr_text = parts[0], parts[1].strip()
+        if expr_text.startswith("="):
+            expr_text = expr_text[1:].strip()
+        try:
+            canonical = velocity.canonical(expr_text)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        low, high = supercollider.fx_range(name)
+        try:
+            preview = velocity.evaluate_span(canonical,
+                                             self._root_shell().project.get("lfos", {}),
+                                             self.bpm, time.monotonic(), low, high)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+        self.fx[name] = canonical
+        self._commit()
+        known = "" if name.lower() in supercollider.FX_RANGES else \
+            " (custom parameter: your SynthDef decides what it does)"
+        print(f"fx {name} set: {canonical}   (now {preview:g}, range "
+              f"{low:g}..{high:g}){known}")
+
+    def do_dump(self, arg):
+        "Record and show the OSC traffic (dump on|off, dump = show the log)"
+        text = (arg or "").strip().lower()
+        engine = self._osc_engine()
+        if text in ("on", "start"):
+            engine.recording = True
+            print(f"OSC recording on (up to {engine.log_limit} packets). "
+                  f"Type 'dump' to show them.")
+            return
+        if text in ("off", "stop"):
+            engine.recording = False
+            print("OSC recording off.")
+            return
+        if text in ("clear", "reset"):
+            engine.log = []
+            print("OSC log cleared.")
+            return
+        print(f"OSC recording: {'on' if engine.recording else 'off'}   "
+              f"target {engine.target_text}, {engine.sent_notes} notes sent")
+        if not engine.log:
+            print(f"  (nothing recorded yet - 'dump on', play, then 'dump')")
+            return
+        print(f"  last {len(engine.log)} packet(s):")
+        for line in engine.log:
+            print(f"    {line}")
+
+    def do_status(self, arg):
+        "Ask the SuperCollider server for its /status (is it running?)"
+        text = (arg or "").strip()
+        if text:
+            try:
+                server = supercollider.parse_target(
+                    text, supercollider.DEFAULT_SERVER_PORT)
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
+            engine = supercollider.engine_for(server, None)
+        else:
+            engine = self._osc_engine()
+        print(f"Pinging {engine.target_text} ...")
+        info = engine.status(timeout=1.5)
+        if not info:
+            print("  No /status.reply: no SuperCollider server is listening "
+                  "there.")
+            print("  Start it (scsynth / 's.boot' in the SC IDE) or set the "
+                  "target with 'osc <host>:<port>'.")
+            return
+        print(f"  Synths {info['synths']}, groups {info['groups']}, "
+              f"SynthDefs {info['synthdefs']}, UGens {info['ugens']}, "
+              f"CPU {info['avg_cpu']:.1f}%, SR {info['sample_rate']:.0f} Hz")
+
+    def _osc_line(self):
+        """One-line summary for views."""
+        engine_text = self.osc_server or (
+            f"{supercollider.DEFAULT_HOST}:{supercollider.DEFAULT_SERVER_PORT}"
+            f" (default)")
+        latency = (self.osc_latency if self.osc_latency is not None
+                   else supercollider.DEFAULT_LATENCY)
+        return (f"OSC {engine_text}, synth "
+                f"'{self.synth or supercollider.DEFAULT_SYNTH}', "
+                f"{self._fx_text()}, latency {latency:g} s")
+
+
     def do_type(self, arg):
-        "Show or set the pattern type: note (default), CC or loop"
+        "Show or set the pattern type: note (default), CC, loop or osc"
         text = (arg or "").strip().lower()
         if not text:
             extra = (f" (controller {self.controller})"
@@ -4154,6 +4962,8 @@ class PatternShell(SeqCompletingCmd):
                 length = self._sample_seconds()
                 secs = f", {length:.2f} s" if length is not None else ""
                 extra = f" (sample {sample}{secs})"
+            elif self.pattern_type == "osc":
+                extra = f" ({self._osc_line()})"
             shown = {"cc": "CC", "loop": "loop"}.get(self.pattern_type, "note")
             print(f"Type: {shown}{extra}")
             return
@@ -4163,9 +4973,11 @@ class PatternShell(SeqCompletingCmd):
             self.pattern_type = "cc"
         elif text in ("loop", "sample", "sampler"):
             self.pattern_type = "loop"
+        elif text in ("osc", "sc", "supercollider"):
+            self.pattern_type = "osc"
         else:
-            print(f"Error: unknown type '{arg.strip()}'. Use 'note', 'CC' or "
-                  f"'loop'.")
+            print(f"Error: unknown type '{arg.strip()}'. Use 'note', 'CC', "
+                  f"'loop' or 'osc'.")
             return
         self._commit()
         if self.pattern_type == "cc":
@@ -4181,6 +4993,10 @@ class PatternShell(SeqCompletingCmd):
             else:
                 print("Type set to loop; choose a file with 'sample <name.wav>' "
                       f"from {sampler.samples_dir()}")
+        elif self.pattern_type == "osc":
+            print(f"Type set to osc ({self._osc_line()}); sequences hold scale "
+                  f"degrees, 'v<k>'/'sus<k>' become amp/dur, 'fx' adds "
+                  f"parameters. Send definitions with 'synthdef <name>'.")
         else:
             print("Type set to note")
 
@@ -4258,6 +5074,26 @@ class PatternShell(SeqCompletingCmd):
             self.do_controller(arg)
         elif verb in ("sample", "samples"):
             self.do_sample(arg)
+        elif verb in ("osc", "sc"):
+            self.do_osc(arg)
+        elif verb == "sclang":
+            self.do_sclang(arg)
+        elif verb == "synth":
+            self.do_synth(arg)
+        elif verb in ("synthdefs", "list-synth"):
+            self.do_synthdef(arg)
+        elif verb in ("synthdef", "synthdefs", "list-synth"):
+            self.do_synthdef(arg)
+        elif verb in ("fx", "effect"):
+            self.do_fx(arg)
+        elif verb == "latency":
+            self.do_latency(arg)
+        elif verb == "dump":
+            self.do_dump(arg)
+        elif verb in ("help", "?", "h"):
+            self.do_help(arg)
+        elif verb == "status":
+            self.do_status(arg)
         elif verb in ("hist", "histogram"):
             self.do_hist(arg)
         elif verb in ("list-s", "list-sequences"):
@@ -4275,8 +5111,8 @@ class PatternShell(SeqCompletingCmd):
         else:
             raise ValueError(f"unknown pattern setting '{verb}' (use scale, "
                              f"root, bpm, channel, division, type, controller, "
-                             f"sample, hist, list-o, select-port, "
-                             f"s<k>, f<k> or o<k>)")
+                             f"sample, osc, synth, fx, latency, synthdef, hist, "
+                             f"list-o, select-port, s<k>, f<k> or o<k>)")
 
     def do_start(self, arg):
         """Play a phrase (f<k>) or a loop order (o<k>): start f0 / start o0"""
@@ -4326,13 +5162,10 @@ class PatternShell(SeqCompletingCmd):
         self._player = None
 
     def do_scale(self, arg):
-        "Show or set the pattern scale (default: chromatic). 'scale ?' lists all known scales"
+        """Show or set the scale: name, catalogue class (hex-07@3) or offsets (0,2,4,7,9). 'scale ?' lists them"""
         name = (arg or "").strip()
-        if name == "?":
-            import textwrap
-            print("Known scales (aliases accepted):")
-            print(textwrap.fill(" ".join(scales.scale_choices()), width=80,
-                                initial_indent="  ", subsequent_indent="  "))
+        if name in ("?", "list") or name.startswith("?"):
+            self._list_scales(name[1:].strip())
             return
         if not name:
             print(f"Scale: {self._key_line()}")
@@ -4340,11 +5173,68 @@ class PatternShell(SeqCompletingCmd):
         key = scales.resolve_scale(name)
         if key is None:
             print(f"Error: unknown scale '{name}'.")
-            print("Hint: type 'scale ?' to list all known scales.")
+            print("Hint: 'scale ?' lists known scales, 'scale ? 6' the hexatonic "
+                  "ones, or give offsets like 'scale 0,2,4,7,9'.")
             return
         self.scale = key
         self._commit()
-        print(f"Scale set: {self._key_line()}{self._live_hint()}")
+        extra = ""
+        if key in scales.CATALOGUE:
+            extra = (f"   (class {_intervals_text(scales.CATALOGUE[key])}, "
+                     f"vector {_vector_text(scales.CATALOGUE[key])})")
+        elif key.startswith("custom-"):
+            extra = "   (custom interval list)"
+        print(f"Scale set: {self._key_line()}{extra}{self._live_hint()}")
+
+    def _list_scales(self, filt=""):
+        """'scale ?' listing: named scales, or catalogue classes with a filter."""
+        import textwrap
+
+        text = (filt or "").strip().lower()
+        if not text:
+            named = sorted(n for n in scales.SCALES
+                           if n not in scales.CATALOGUE)
+            print("Named scales (aliases accepted, 5/6/7 notes):")
+            print(textwrap.fill(" ".join(named), width=78, initial_indent="  ",
+                                subsequent_indent="  "))
+            print(f"Catalogue of set classes ({len(scales.CATALOGUE)} generated, "
+                  f"complete for those note counts):")
+            for cardinality in scales.CATALOGUE_CARDINALITIES:
+                keys = scales.catalogue_names(cardinality)
+                print(f"  {cardinality} notes: {keys[0]}..{keys[-1]}   "
+                      f"({len(keys)} classes, prefix "
+                      f"'{scales.CARDINALITY_NAMES[cardinality]}')")
+            print("  'scale ? 6'       list one cardinality (5, 6 or 7)")
+            print("  'scale ? <text>'  filter by name")
+            print("  'scale hex-07@3'  pick a mode of a class")
+            print("  'scale 0,2,4,7,9' set any interval list")
+            return
+
+        keys = []
+        if text.isdigit() and int(text) in scales.CARDINALITY_NAMES:
+            keys = scales.catalogue_names(int(text))
+        elif text in scales.CARDINALITY_NAMES.values():
+            keys = scales.catalogue_names(prefix=text)
+        else:
+            keys = [k for k in scales.catalogue_names() if text in k]
+            if not keys:
+                named = [n for n in scales.scale_choices() if text in n]
+                if named:
+                    print(f"Scales matching '{filt}':")
+                    print(textwrap.fill(" ".join(named), width=78,
+                                        initial_indent="  ",
+                                        subsequent_indent="  "))
+                    return
+                print(f"No scale matches '{filt}'.")
+                return
+        print(f"Set classes matching '{filt}' ({len(keys)}):")
+        for key in keys:
+            form = scales.CATALOGUE[key]
+            named = [n for n in scales.named_scales_for(form) if n != key]
+            extra = f"   [{', '.join(named)}]" if named else ""
+            print(f"  {key:<8} {_intervals_text(form):<24} "
+                  f"vector {_vector_text(form)}  modes "
+                  f"{len(scales.rotations(form))}{extra}")
 
     def complete_scale(self, text, line, begidx, endidx):
         choices = scales.scale_choices()
@@ -4519,16 +5409,18 @@ class PatternShell(SeqCompletingCmd):
         preview = velocity.evaluate(canonical,
                                     self._root_shell().project.get("lfos", {}),
                                     self.bpm, time.monotonic())
-        print(f"v{index} set: {canonical}   (now {preview})")
+        target = f"o{index}" if self.pattern_type == "loop" else f"s{index}"
+        print(f"v{index} set: {canonical}   (now {preview}; scales {target})")
         return True
 
     def show_velocity(self, n):
         """Print one stored velocity expression."""
+        target = f"o{n} (volume)" if self.pattern_type == "loop" else f"s{n}"
         if n in self.velocities:
-            print(f"v{n}: {self.velocities[n]}")
+            print(f"v{n}: {self.velocities[n]}   (scales {target})")
         else:
-            print(f"v{n}: not configured. Usage: v{n} <value|expr>  "
-                  f"e.g. v{n} 45 or v{n} 64+0.4*lfo1")
+            print(f"v{n}: not configured (scales {target}). "
+                  f"Usage: v{n} <value|expr>  e.g. v{n} 45 or v{n} 64+0.4*lfo1")
 
     def set_sustain(self, index, text, via_path=False):
         """Set sustain sus<index> (share of the step; constant or LFO-linked)."""
@@ -4725,6 +5617,15 @@ class PatternShell(SeqCompletingCmd):
         print(f"  {'list-sus':<20} - list all configured sustains")
         print(f"  {'list-mt':<20} - list all configured microtimings")
         print(f"  {'hist [f<k>|s<k>|o<k>]':<20} - per-step histogram (loop: sample positions); add 'live'")
+        print(f"  {'v0..v9 [value|expr]':<20} - velocity: note loudness, or the volume of loop order o<k>")
+        print(f"  {'osc [<host>:<port>]':<20} - osc pattern: SuperCollider server (default 127.0.0.1:57110)")
+        print(f"  {'synth [<name>]':<20} - SynthDef the osc pattern plays (default '{supercollider.DEFAULT_SYNTH}')")
+        print(f"  {'synthdef [all|<name>]':<20} - list built-ins, or install them (all = one shot)")
+        print(f"  {'synth <name>':<20} - which SynthDef this pattern plays (seq, bass, bell, pad, ...)")
+        print(f"  {'fx [<name> <expr>]':<20} - per-note effect parameter, e.g. fx cutoff 2000+1500*lfo1")
+        print(f"  {'latency [<seconds>]':<20} - OSC scheduling slack (default {supercollider.DEFAULT_LATENCY:g} s; raise it if SC says 'late')")
+        print(f"  {'dump [on|off]':<20} - record and show the OSC packets (self-test without SC)")
+        print(f"  {'status':<20} - ping the SuperCollider server for /status.reply")
         print(f"  {'':<20}   note/CC: f<k> phrase or s<k> sequence; loop: f<k> arrangement or o<k> order")
         print(f"  {'':<20}   (loop patterns have no histogram: use list-o)")
         print(f"  {'start f<k>':<20} - play phrase k to the MIDI output (velocity 100)")
@@ -4735,7 +5636,7 @@ class PatternShell(SeqCompletingCmd):
         print(f"  {'select-port':<20} - set this pattern's MIDI output port")
         print(f"  {'bpm [<value>]':<20} - set this pattern's BPM (default: inherits global)")
         print(f"  {'division [1/16]':<20} - step note value (1, 1/2, 1/3, 1/16 ...)")
-        print(f"  {'type [note|CC|loop]':<20} - pattern kind (default: note); CC = controller data")
+        print(f"  {'type [note|CC|loop|osc]':<20} - pattern kind (default: note); CC = controller data")
         print(f"  {'sample [<file.wav>]':<20} - loop pattern: choose a .wav from the samples folder")
         print(f"  {'o0..o9 [slice...]':<20} - loop slice order, e.g. o0 0 1 4 2 5 ('r' = rest)")
         print(f"  {'':<20}   positions are normalised (0.2 = 20 %); LFO entries work too: o0 0.2 0.5*lfo1")
